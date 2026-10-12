@@ -5,8 +5,9 @@
 #>
 
 param (
-    [string]$ServerEndpoint   = "http://mysite.test/index.php/wp-json/activitywatch/v1/sync",
-    [string]$ApiToken         = "REPLACE_WITH_API_TOKEN",
+    [Parameter(Mandatory = $true)][string]$ServerEndpoint,
+    [Parameter(Mandatory = $true)][string]$ApiToken,
+    [string]$CaBundlePath     = "",
     [string]$NetworkSharePath = "C:\AW_Setup",
     [int]$SyncIntervalSeconds = 1800
 )
@@ -39,9 +40,14 @@ foreach ($dir in @($InstallDir, $BridgeDir, "$DataDir\users")) {
     }
 }
 
-# Every interactive user needs to create and write its own state folder under
-# ProgramData, otherwise the second user on a shared PC silently loses its queue.
-icacls $DataDir /grant "BUILTIN\Users:(OI)(CI)M" /T /Q | Out-Null
+# Every interactive user must be able to create its own state folder under
+# users\, but must not be able to edit config.json (server URL / token).
+icacls $DataDir /reset /T /Q | Out-Null
+icacls "$DataDir\users" /grant "BUILTIN\Users:(OI)(CI)M" /T /Q | Out-Null
+
+if ($ServerEndpoint -notmatch '^https://') {
+    Write-Log "WARNING: $ServerEndpoint is not HTTPS; the token and activity data travel unencrypted on the LAN."
+}
 
 # ── 3. Copy ActivityWatch Binaries & Bridge Scripts ──
 Write-Log "Copying ActivityWatch binaries and launcher..."
@@ -58,14 +64,21 @@ if (Test-Path "$NetworkSharePath\python") {
     Write-Log "WARNING: Bundled Python not found in network share!"
 }
 
-# ── 5. Patch API Endpoint, Token and Sync Interval into Agent ──
-Write-Log "Patching API credentials..."
-$AgentScriptPath = "$BridgeDir\aw_bridge_agent.py"
-(Get-Content $AgentScriptPath) |
-    ForEach-Object { $_ -replace 'WP_API_URL = ".*"',   "WP_API_URL = `"$ServerEndpoint`"" } |
-    ForEach-Object { $_ -replace 'WP_API_TOKEN = ".*"', "WP_API_TOKEN = `"$ApiToken`"" } |
-    ForEach-Object { $_ -replace '^SYNC_INTERVAL_SECONDS = \d+', "SYNC_INTERVAL_SECONDS = $SyncIntervalSeconds" } |
-    Set-Content $AgentScriptPath
+# ── 5. Write agent configuration (read-only for users) ──
+Write-Log "Writing $DataDir\config.json..."
+$Config = [ordered]@{
+    server_url             = $ServerEndpoint
+    api_token              = $ApiToken
+    verify_tls             = $true
+    ca_bundle              = $CaBundlePath
+    sync_interval_seconds  = $SyncIntervalSeconds
+    idle_threshold_seconds = 300
+    user_identity          = "account"
+}
+$ConfigPath = "$DataDir\config.json"
+[System.IO.File]::WriteAllText($ConfigPath, ($Config | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+icacls $ConfigPath /inheritance:r /grant:r "SYSTEM:F" "BUILTIN\Administrators:F" "BUILTIN\Users:R" /Q | Out-Null
+if ($CaBundlePath -and !(Test-Path $CaBundlePath)) { Write-Log "WARNING: CA bundle $CaBundlePath not found." }
 
 # ── 6. Register Scheduled Task with Dual Triggers ──
 Write-Log "Registering scheduled task..."
