@@ -3,7 +3,7 @@
  * Plugin Name: ActivityWatch WordPress Tracker
  * Plugin URI:  https://github.com/activitytrack/activitywatch-wp-tracker
  * Description: Enterprise usage tracking system. Aggregates desktop activity across LAN PCs, floating users, departments, and applications.
- * Version:     1.5.0
+ * Version:     1.6.0
  * Author:      Amit Pailwan
  * Text Domain: aw-wp-tracker
  */
@@ -12,13 +12,24 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('AW_TRACKER_VERSION', '1.5.0');
+define('AW_TRACKER_VERSION', '1.6.0');
+define('AW_TRACKER_DB_VERSION', '1.6.0');
+define('AW_TRACKER_NO_DEPARTMENT', '__no_department_assigned__');
 define('AW_TRACKER_TABLE_LOGS', 'aw_activity_logs');
 define('AW_TRACKER_TABLE_DEVICES', 'aw_devices');
 define('AW_TRACKER_TABLE_SUMMARY', 'aw_daily_summary');
 
 register_activation_hook(__FILE__, 'aw_tracker_activate');
 register_deactivation_hook(__FILE__, 'aw_tracker_deactivate');
+
+// Overwriting the plugin file does not fire the activation hook, so schema
+// upgrades run on the first request after the file is replaced.
+add_action('plugins_loaded', 'aw_tracker_maybe_upgrade');
+function aw_tracker_maybe_upgrade() {
+    if (get_option('aw_tracker_db_version') !== AW_TRACKER_DB_VERSION) {
+        aw_tracker_activate();
+    }
+}
 
 function aw_tracker_activate() {
     global $wpdb;
@@ -28,6 +39,7 @@ function aw_tracker_activate() {
     $table_logs = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
     $sql_logs = "CREATE TABLE $table_logs (
         id bigint(20) NOT NULL AUTO_INCREMENT,
+        event_uid varchar(64) DEFAULT NULL,
         machine_identifier varchar(100) NOT NULL,
         os_user varchar(150) DEFAULT 'Unknown',
         os_platform varchar(50) DEFAULT 'Windows',
@@ -35,9 +47,12 @@ function aw_tracker_activate() {
         window_title text DEFAULT NULL,
         duration_seconds int(11) NOT NULL DEFAULT 0,
         is_idle tinyint(1) NOT NULL DEFAULT 0,
+        rolled_seconds int(11) NOT NULL DEFAULT 0,
         logged_at datetime NOT NULL,
         created_at datetime DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY  (id),
+        UNIQUE KEY uq_event_uid (event_uid),
+        KEY idx_logged (logged_at),
         KEY idx_machine_logged (machine_identifier, logged_at),
         KEY idx_user (os_user),
         KEY idx_app (application_name(191))
@@ -48,6 +63,7 @@ function aw_tracker_activate() {
     $sql_devices = "CREATE TABLE $table_devices (
         id bigint(20) NOT NULL AUTO_INCREMENT,
         machine_identifier varchar(100) NOT NULL,
+        machine_uuid varchar(64) DEFAULT NULL,
         ashram varchar(100) DEFAULT 'Main Ashram',
         building varchar(100) DEFAULT 'Main Building',
         room varchar(50) DEFAULT 'General Room',
@@ -69,7 +85,7 @@ function aw_tracker_activate() {
         active_seconds int(11) NOT NULL DEFAULT 0,
         idle_seconds int(11) NOT NULL DEFAULT 0,
         created_at datetime DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
+        PRIMARY KEY  (id),
         UNIQUE KEY uq_daily_metric (log_date, machine_identifier, os_user, application_name(191)),
         KEY idx_date_machine (log_date, machine_identifier),
         KEY idx_date_user (log_date, os_user)
@@ -79,6 +95,12 @@ function aw_tracker_activate() {
     dbDelta($sql_logs);
     dbDelta($sql_devices);
     dbDelta($sql_summary);
+
+    $previous_db_version = get_option('aw_tracker_db_version');
+    if ($previous_db_version !== AW_TRACKER_DB_VERSION) {
+        aw_tracker_migrate_rollup_state();
+        update_option('aw_tracker_db_version', AW_TRACKER_DB_VERSION);
+    }
 
     if (!get_option('aw_tracker_api_secret')) {
         update_option('aw_tracker_api_secret', wp_generate_password(32, false));
@@ -103,6 +125,32 @@ function aw_tracker_activate() {
     if (!wp_next_scheduled('aw_tracker_daily_maintenance_event')) {
         $two_am = strtotime('tomorrow 02:00:00');
         wp_schedule_event($two_am, 'daily', 'aw_tracker_daily_maintenance_event');
+    }
+}
+
+/**
+ * One-time move to incremental rollups (rolled_seconds). Days still fully held
+ * in raw logs are rebuilt from raw; the oldest raw day may already be partly
+ * purged, so its existing summary is kept and its raw rows are marked rolled.
+ */
+function aw_tracker_migrate_rollup_state() {
+    global $wpdb;
+    $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
+    $table_summary = $wpdb->prefix . AW_TRACKER_TABLE_SUMMARY;
+
+    $oldest = $wpdb->get_var("SELECT DATE(MIN(logged_at)) FROM {$table_logs}");
+    if (!$oldest) {
+        return;
+    }
+    $next_day = wp_date('Y-m-d', strtotime($oldest . ' 12:00:00 +1 day'));
+    $oldest_has_summary = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$table_summary} WHERE log_date = %s", $oldest));
+
+    $wpdb->query($wpdb->prepare("DELETE FROM {$table_summary} WHERE log_date > %s", $oldest));
+    if ($oldest_has_summary) {
+        $wpdb->query($wpdb->prepare("UPDATE {$table_logs} SET rolled_seconds = duration_seconds WHERE logged_at < %s", $next_day . ' 00:00:00'));
+        update_option('aw_raw_complete_from', $next_day);
+    } elseif ((int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$table_summary} WHERE log_date < %s", $oldest))) {
+        update_option('aw_raw_complete_from', $oldest);
     }
 }
 
@@ -140,9 +188,16 @@ function aw_tracker_get_user_department_restriction() {
     if (current_user_can('manage_options') || current_user_can('manage_aw_tracker')) {
         return null; // Full Access
     }
-    $user_id = get_current_user_id();
-    $assigned_dept = get_user_meta($user_id, 'aw_assigned_department', true);
-    return !empty($assigned_dept) ? sanitize_text_field($assigned_dept) : null;
+    $user     = wp_get_current_user();
+    $assigned = sanitize_text_field((string) get_user_meta($user->ID, 'aw_assigned_department', true));
+    if ($assigned !== '') {
+        return $assigned;
+    }
+    // A department admin without a department must never fall through to fleet-wide access.
+    if (in_array('aw_dept_admin', (array) $user->roles, true)) {
+        return AW_TRACKER_NO_DEPARTMENT;
+    }
+    return null;
 }
 
 // Add user profile department field for Dept Admins
@@ -214,92 +269,183 @@ function aw_tracker_verify_api_auth($request) {
     return true;
 }
 
+/**
+ * Use the registered device row unless its hardware id differs: two machines
+ * with the same hostname then get distinct identifiers instead of merging.
+ */
+function aw_tracker_resolve_machine_identifier($hostname, $machine_uuid) {
+    global $wpdb;
+    if ($machine_uuid === '') {
+        return $hostname;
+    }
+    $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
+    $known = $wpdb->get_var($wpdb->prepare(
+        "SELECT machine_identifier FROM {$table_devices} WHERE machine_uuid = %s AND machine_identifier LIKE %s LIMIT 1",
+        $machine_uuid, $wpdb->esc_like($hostname) . '%'
+    ));
+    if ($known) {
+        return $known;
+    }
+    $existing_uuid = $wpdb->get_var($wpdb->prepare("SELECT machine_uuid FROM {$table_devices} WHERE machine_identifier = %s", $hostname));
+    if ($existing_uuid === null || $existing_uuid === '' || $existing_uuid === $machine_uuid) {
+        return $hostname;
+    }
+    return substr($hostname, 0, 92) . '-' . substr(preg_replace('/[^a-z0-9]/', '', $machine_uuid), 0, 6);
+}
+
+/** Split [start, start+duration) at WordPress-local midnights. */
+function aw_tracker_split_at_midnight($start, $duration) {
+    $tz     = wp_timezone();
+    $end    = $start + $duration;
+    $cursor = $start;
+    $pieces = array();
+    do {
+        $next_midnight = (new DateTimeImmutable('@' . $cursor))->setTimezone($tz)->setTime(0, 0)->modify('+1 day')->getTimestamp();
+        $piece_end = min($end, $next_midnight);
+        $pieces[]  = array($cursor, $piece_end - $cursor);
+        $cursor    = $piece_end;
+    } while ($cursor < $end && count($pieces) < 62);
+    return $pieces;
+}
+
 function aw_tracker_handle_sync_payload($request) {
     global $wpdb;
     $params = $request->get_json_params();
 
-    if (empty($params) || !isset($params['machine_identifier']) || !isset($params['events'])) {
+    if (empty($params) || !isset($params['machine_identifier']) || !isset($params['events']) || !is_array($params['events'])) {
         return new WP_REST_Response(array('success' => false, 'message' => 'Invalid payload structure.'), 400);
     }
 
-    $machine            = sanitize_text_field($params['machine_identifier']);
-    $os_platform        = isset($params['os_platform']) ? sanitize_text_field($params['os_platform']) : 'Windows';
-    $events             = $params['events'];
+    $machine_uuid = isset($params['machine_uuid']) ? strtolower(sanitize_text_field($params['machine_uuid'])) : '';
+    $machine      = aw_tracker_resolve_machine_identifier(sanitize_text_field($params['machine_identifier']), $machine_uuid);
+    $os_platform  = isset($params['os_platform']) ? sanitize_text_field($params['os_platform']) : 'Windows';
+    $events       = $params['events'];
     $current_local_time = current_time('mysql');
-
-    // 1. Touch Device Record with Local Timestamp
+    $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
     $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
-    $wpdb->query($wpdb->prepare("
-        INSERT INTO $table_devices (machine_identifier, last_seen)
-        VALUES (%s, %s)
-        ON DUPLICATE KEY UPDATE last_seen = %s
-    ", $machine, $current_local_time, $current_local_time));
+    $tz            = wp_timezone();
 
-    // 2. Insert or Update Logs (Upsert Logic)
-    $processed_count = 0;
-    if (!empty($events) && is_array($events)) {
-        $table_logs = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
+    $accepted = 0;
+    $skipped  = 0;
+    $failed   = false;
 
-        foreach ($events as $event) {
-            $os_user   = isset($event['user']) ? sanitize_text_field($event['user']) : 'Unknown';
-            $app_name  = isset($event['app']) ? sanitize_text_field($event['app']) : 'Unknown';
-            $title     = isset($event['title']) ? sanitize_text_field($event['title']) : '';
-            $duration  = isset($event['duration']) ? intval($event['duration']) : 0;
-            $is_idle   = !empty($event['is_idle']) ? 1 : 0;
-            $logged_at = isset($event['logged_at']) ? sanitize_text_field($event['logged_at']) : $current_local_time;
+    // All rows of a batch commit together, so a success response always means
+    // every record is stored and a failure means none is.
+    $wpdb->query('START TRANSACTION');
 
-            if ($duration <= 0) {
+    foreach ($events as $event) {
+        if (!is_array($event)) {
+            $accepted++;
+            $skipped++;
+            continue;
+        }
+        $os_user    = isset($event['user']) ? sanitize_text_field($event['user']) : 'Unknown';
+        $app_name   = isset($event['app']) ? sanitize_text_field($event['app']) : 'Unknown';
+        $title      = isset($event['title']) ? sanitize_text_field($event['title']) : '';
+        $duration   = isset($event['duration']) ? intval($event['duration']) : 0;
+        $is_idle    = !empty($event['is_idle']) ? 1 : 0;
+        $is_session = ($app_name === 'System Session');
+        $uid        = isset($event['uid']) ? substr(preg_replace('/[^A-Za-z0-9_\-]/', '', (string) $event['uid']), 0, 56) : '';
+
+        if ($duration < 0 || ($duration === 0 && !$is_session)) {
+            $accepted++;
+            $skipped++;
+            continue;
+        }
+
+        if (isset($event['ts']) && is_numeric($event['ts']) && $event['ts'] > 946684800) {
+            $start = (int) $event['ts'];
+        } else {
+            $parsed = isset($event['logged_at']) ? DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', (string) $event['logged_at'], $tz) : false;
+            if (!$parsed) {
+                $accepted++;
+                $skipped++;
                 continue;
             }
-
-            $existing_id = $wpdb->get_var($wpdb->prepare(
-                "SELECT id FROM {$table_logs} 
-                 WHERE machine_identifier = %s 
-                   AND os_user = %s
-                   AND application_name = %s 
-                   AND logged_at = %s",
-                $machine,
-                $os_user,
-                $app_name,
-                $logged_at
-            ));
-
-            if ($existing_id) {
-                $wpdb->update(
-                    $table_logs,
-                    array(
-                        'duration_seconds' => $duration,
-                        'window_title'     => $title,
-                        'is_idle'          => $is_idle,
-                        'os_user'          => $os_user
-                    ),
-                    array('id' => $existing_id),
-                    array('%d', '%s', '%d', '%s'),
-                    array('%d')
-                );
-            } else {
-                $wpdb->insert(
-                    $table_logs,
-                    array(
-                        'machine_identifier' => $machine,
-                        'os_user'            => $os_user,
-                        'os_platform'        => $os_platform,
-                        'application_name'   => $app_name,
-                        'window_title'       => $title,
-                        'duration_seconds'   => $duration,
-                        'is_idle'            => $is_idle,
-                        'logged_at'          => $logged_at,
-                    ),
-                    array('%s', '%s', '%s', '%s', '%s', '%d', '%d', '%s')
-                );
-            }
-            $processed_count++;
+            $start = $parsed->getTimestamp();
         }
+
+        foreach (aw_tracker_split_at_midnight($start, $duration) as $index => $piece) {
+            $logged_at = wp_date('Y-m-d H:i:s', $piece[0]);
+            $seconds   = (int) $piece[1];
+
+            if ($uid !== '') {
+                $result = $wpdb->query($wpdb->prepare(
+                    "INSERT INTO {$table_logs}
+                        (event_uid, machine_identifier, os_user, os_platform, application_name, window_title, duration_seconds, is_idle, logged_at)
+                     VALUES (%s, %s, %s, %s, %s, %s, %d, %d, %s)
+                     ON DUPLICATE KEY UPDATE
+                        duration_seconds = VALUES(duration_seconds),
+                        window_title     = VALUES(window_title)",
+                    $index === 0 ? $uid : $uid . '#' . $index,
+                    $machine, $os_user, $os_platform, $app_name, $title, $seconds, $is_idle, $logged_at
+                ));
+            } else {
+                // Agents older than v3 send no uid: keep the previous match-and-update behaviour.
+                $existing_id = $wpdb->get_var($wpdb->prepare(
+                    "SELECT id FROM {$table_logs}
+                     WHERE machine_identifier = %s AND os_user = %s AND application_name = %s AND logged_at = %s",
+                    $machine, $os_user, $app_name, $logged_at
+                ));
+                if ($existing_id) {
+                    $result = $wpdb->update(
+                        $table_logs,
+                        array('duration_seconds' => $seconds, 'window_title' => $title, 'is_idle' => $is_idle),
+                        array('id' => $existing_id),
+                        array('%d', '%s', '%d'),
+                        array('%d')
+                    );
+                } else {
+                    $result = $wpdb->insert(
+                        $table_logs,
+                        array(
+                            'machine_identifier' => $machine,
+                            'os_user'            => $os_user,
+                            'os_platform'        => $os_platform,
+                            'application_name'   => $app_name,
+                            'window_title'       => $title,
+                            'duration_seconds'   => $seconds,
+                            'is_idle'            => $is_idle,
+                            'logged_at'          => $logged_at,
+                        ),
+                        array('%s', '%s', '%s', '%s', '%s', '%d', '%d', '%s')
+                    );
+                }
+            }
+            if ($result === false) {
+                $failed = true;
+                break 2;
+            }
+        }
+        $accepted++;
+    }
+
+    if (!$failed) {
+        $touched = $wpdb->query($wpdb->prepare("
+            INSERT INTO {$table_devices} (machine_identifier, machine_uuid, last_seen)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE last_seen = VALUES(last_seen),
+                                    machine_uuid = COALESCE(NULLIF(machine_uuid, ''), VALUES(machine_uuid))
+        ", $machine, $machine_uuid !== '' ? $machine_uuid : null, $current_local_time));
+        $failed = ($touched === false);
+    }
+
+    if ($failed || $wpdb->query('COMMIT') === false) {
+        $error = $wpdb->last_error;
+        $wpdb->query('ROLLBACK');
+        error_log('[ActivityWatch Tracker] Sync batch from ' . $machine . ' rolled back: ' . $error);
+        return new WP_REST_Response(array(
+            'success'  => false,
+            'accepted' => 0,
+            'message'  => 'Database write failed; batch rolled back. Retry later.',
+        ), 500);
     }
 
     return new WP_REST_Response(array(
         'success'        => true,
-        'processed_rows' => $processed_count,
+        'accepted'       => $accepted,
+        'skipped'        => $skipped,
+        'processed_rows' => $accepted - $skipped,
         'machine'        => $machine,
         'last_seen'      => $current_local_time
     ), 200);
@@ -308,78 +454,165 @@ function aw_tracker_handle_sync_payload($request) {
 // ==================== DAILY ROLLUP & PRUNING LOGIC ====================
 add_action('aw_tracker_daily_maintenance_event', 'aw_tracker_run_daily_maintenance');
 
+/**
+ * Add every not-yet-summarised second (duration_seconds - rolled_seconds) to
+ * the daily summary. Incremental and idempotent: late/offline records and
+ * extended durations are picked up on any later run, and re-running adds 0.
+ * Returns the number of raw rows rolled up, or false on failure.
+ */
+function aw_tracker_rollup_pending() {
+    global $wpdb;
+    $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
+    $table_summary = $wpdb->prefix . AW_TRACKER_TABLE_SUMMARY;
+
+    $max_id = (int) $wpdb->get_var("SELECT MAX(id) FROM {$table_logs}");
+    if (!$max_id) {
+        return 0;
+    }
+
+    $wpdb->query('START TRANSACTION');
+    $locked = $wpdb->get_var($wpdb->prepare(
+        "SELECT COUNT(*) FROM {$table_logs} WHERE id <= %d AND duration_seconds <> rolled_seconds FOR UPDATE", $max_id
+    ));
+    $inserted = $wpdb->query($wpdb->prepare("
+        INSERT INTO {$table_summary} (log_date, machine_identifier, os_user, application_name, active_seconds, idle_seconds)
+        SELECT DATE(logged_at), machine_identifier, os_user, application_name,
+               SUM(CASE WHEN is_idle = 0 THEN duration_seconds - rolled_seconds ELSE 0 END),
+               SUM(CASE WHEN is_idle = 1 THEN duration_seconds - rolled_seconds ELSE 0 END)
+        FROM {$table_logs}
+        WHERE id <= %d AND duration_seconds <> rolled_seconds AND application_name <> 'System Session'
+        GROUP BY DATE(logged_at), machine_identifier, os_user, application_name
+        ON DUPLICATE KEY UPDATE
+            active_seconds = active_seconds + VALUES(active_seconds),
+            idle_seconds   = idle_seconds + VALUES(idle_seconds)
+    ", $max_id));
+    $updated = $wpdb->query($wpdb->prepare(
+        "UPDATE {$table_logs} SET rolled_seconds = duration_seconds WHERE id <= %d AND duration_seconds <> rolled_seconds", $max_id
+    ));
+
+    if ($locked === null || $inserted === false || $updated === false || $wpdb->query('COMMIT') === false) {
+        $wpdb->query('ROLLBACK');
+        return false;
+    }
+    return (int) $updated;
+}
+
+/** First day (Y-m-d, WordPress timezone) that must be kept for a retention setting, or null. */
+function aw_tracker_retention_cutoff_day($setting) {
+    $today = new DateTimeImmutable('today', wp_timezone());
+    $map = array(
+        '2_hours'   => 'today',
+        '3_months'  => '-3 months',
+        '6_months'  => '-6 months',
+        '12_months' => '-12 months',
+        '36_months' => '-36 months',
+        '60_months' => '-60 months',
+    );
+    if (!isset($map[$setting])) {
+        return null; // 'indefinite' or unknown: never purge
+    }
+    return $setting === '2_hours' ? $today->format('Y-m-d') : $today->modify($map[$setting])->format('Y-m-d');
+}
+
 function aw_tracker_run_daily_maintenance() {
     global $wpdb;
     $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
     $table_summary = $wpdb->prefix . AW_TRACKER_TABLE_SUMMARY;
 
-    // Fix #1: Only roll up the past 2 days (yesterday + today) to avoid full-table
-    // re-aggregation on every run as raw data grows across 275 machines.
-    $rollup_since = current_time('Y-m-d', false);
-    // Use yesterday as the cutoff so a full day is always captured
-    $rollup_since = wp_date('Y-m-d', strtotime('-1 day', current_time('timestamp')));
+    $rolled = aw_tracker_rollup_pending();
+    update_option('aw_tracker_last_rollup_since', current_time('mysql') . ($rolled === false ? ' (FAILED)' : ' (' . (int) $rolled . ' rows)'));
+    if ($rolled === false) {
+        // Never delete raw data that could not be summarised.
+        update_option('aw_tracker_last_prune_time', current_time('mysql') . ' (skipped: rollup failed)');
+        return array('deleted_raw' => 0, 'deleted_summary' => 0, 'error' => 'rollup_failed');
+    }
 
-    $wpdb->query($wpdb->prepare("
-        INSERT INTO {$table_summary} (log_date, machine_identifier, os_user, application_name, active_seconds, idle_seconds)
-        SELECT 
-            DATE(logged_at) as log_date,
-            machine_identifier,
-            os_user,
-            application_name,
-            SUM(CASE WHEN is_idle = 0 THEN duration_seconds ELSE 0 END) as active_seconds,
-            SUM(CASE WHEN is_idle = 1 THEN duration_seconds ELSE 0 END) as idle_seconds
-        FROM {$table_logs}
-        WHERE DATE(logged_at) >= %s
-        GROUP BY DATE(logged_at), machine_identifier, os_user, application_name
-        ON DUPLICATE KEY UPDATE
-            active_seconds = VALUES(active_seconds),
-            idle_seconds   = VALUES(idle_seconds)
-    ", $rollup_since));
-
-    // Fix #2: Use current_time('timestamp') for all cutoff calculations so
-    // they respect the WordPress timezone setting, not the PHP server timezone.
-    $now_ts      = current_time('timestamp');
-    $raw_setting = get_option('aw_raw_retention_setting', '6_months');
+    // Raw purges are whole days, and only rows already in the summary are removed.
     $deleted_raw = 0;
-
-    if ($raw_setting === '2_hours') {
-        $raw_cutoff  = wp_date('Y-m-d H:i:s', strtotime('-2 hours', $now_ts));
-        $deleted_raw = $wpdb->query($wpdb->prepare("DELETE FROM {$table_logs} WHERE logged_at < %s", $raw_cutoff));
-    } elseif ($raw_setting === '3_months') {
-        $raw_cutoff  = wp_date('Y-m-d 00:00:00', strtotime('-3 months', $now_ts));
-        $deleted_raw = $wpdb->query($wpdb->prepare("DELETE FROM {$table_logs} WHERE logged_at < %s", $raw_cutoff));
-    } elseif ($raw_setting === '6_months') {
-        $raw_cutoff  = wp_date('Y-m-d 00:00:00', strtotime('-6 months', $now_ts));
-        $deleted_raw = $wpdb->query($wpdb->prepare("DELETE FROM {$table_logs} WHERE logged_at < %s", $raw_cutoff));
-    } elseif ($raw_setting === '12_months') {
-        $raw_cutoff  = wp_date('Y-m-d 00:00:00', strtotime('-12 months', $now_ts));
-        $deleted_raw = $wpdb->query($wpdb->prepare("DELETE FROM {$table_logs} WHERE logged_at < %s", $raw_cutoff));
+    $raw_cutoff  = aw_tracker_retention_cutoff_day(get_option('aw_raw_retention_setting', '6_months'));
+    if ($raw_cutoff) {
+        $deleted_raw = $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$table_logs} WHERE logged_at < %s AND rolled_seconds = duration_seconds", $raw_cutoff . ' 00:00:00'
+        ));
+        if ($deleted_raw !== false && $raw_cutoff > (string) get_option('aw_raw_complete_from', '')) {
+            update_option('aw_raw_complete_from', $raw_cutoff);
+        }
     }
-    // Fix #3: Explicit no-op for 'indefinite' — no pruning performed, no silent fallthrough.
-    // elseif ($raw_setting === 'indefinite') { /* No pruning — keep all raw logs */ }
 
-    $summary_setting = get_option('aw_summary_retention_setting', '36_months');
     $deleted_summary = 0;
-
-    if ($summary_setting === '12_months') {
-        $summary_cutoff  = wp_date('Y-m-d', strtotime('-12 months', $now_ts));
-        $deleted_summary = $wpdb->query($wpdb->prepare("DELETE FROM {$table_summary} WHERE log_date < %s", $summary_cutoff));
-    } elseif ($summary_setting === '36_months') {
-        $summary_cutoff  = wp_date('Y-m-d', strtotime('-36 months', $now_ts));
-        $deleted_summary = $wpdb->query($wpdb->prepare("DELETE FROM {$table_summary} WHERE log_date < %s", $summary_cutoff));
-    } elseif ($summary_setting === '60_months') {
-        $summary_cutoff  = wp_date('Y-m-d', strtotime('-60 months', $now_ts));
+    $summary_cutoff  = aw_tracker_retention_cutoff_day(get_option('aw_summary_retention_setting', '36_months'));
+    if ($summary_cutoff) {
         $deleted_summary = $wpdb->query($wpdb->prepare("DELETE FROM {$table_summary} WHERE log_date < %s", $summary_cutoff));
     }
-    // elseif ($summary_setting === 'indefinite') { /* No pruning — keep all summaries */ }
 
-    // Fix #4: Persist both raw and summary deleted counts for the diagnostic UI.
     update_option('aw_tracker_last_prune_time', current_time('mysql'));
-    update_option('aw_tracker_last_prune_deleted_raw', (int)$deleted_raw);
-    update_option('aw_tracker_last_prune_deleted_summary', (int)$deleted_summary);
-    update_option('aw_tracker_last_rollup_since', $rollup_since);
+    update_option('aw_tracker_last_prune_deleted_raw', (int) $deleted_raw);
+    update_option('aw_tracker_last_prune_deleted_summary', (int) $deleted_summary);
 
-    return array('deleted_raw' => $deleted_raw, 'deleted_summary' => $deleted_summary);
+    return array('deleted_raw' => (int) $deleted_raw, 'deleted_summary' => (int) $deleted_summary);
+}
+
+/** Start/end (end exclusive) in WordPress local time for a time-range filter. */
+function aw_tracker_time_bounds($time_range, $date_from = '', $date_to = '') {
+    $tz    = wp_timezone();
+    $now   = new DateTimeImmutable('now', $tz);
+    $today = $now->setTime(0, 0);
+    $week  = $today->modify('-' . ((int) $today->format('N') - 1) . ' days');
+    $month = $today->modify('first day of this month');
+    switch ($time_range) {
+        case '1h':         return array($now->modify('-1 hour'), null);
+        case 'today':      return array($today, null);
+        case 'yesterday':  return array($today->modify('-1 day'), $today);
+        case '24h':        return array($now->modify('-24 hours'), null);
+        case '7d':         return array($now->modify('-7 days'), null);
+        case 'this_week':  return array($week, null);
+        case 'last_week':  return array($week->modify('-7 days'), $week);
+        case 'this_month': return array($month, null);
+        case 'last_month': return array($month->modify('-1 month'), $month);
+        case 'custom':
+            $from = DateTimeImmutable::createFromFormat('!Y-m-d', (string) $date_from, $tz);
+            $to   = DateTimeImmutable::createFromFormat('!Y-m-d', (string) $date_to, $tz);
+            if (!$from || !$to) {
+                return array(null, null);
+            }
+            if ($from > $to) {
+                list($from, $to) = array($to, $from);
+            }
+            return array($from, $to->modify('+1 day'));
+    }
+    return array(null, null);
+}
+
+function aw_tracker_time_sql($time_range, $date_from = '', $date_to = '', $column = 'l.logged_at') {
+    global $wpdb;
+    list($start, $end) = aw_tracker_time_bounds($time_range, $date_from, $date_to);
+    $sql = '';
+    if ($start) $sql .= $wpdb->prepare(" AND {$column} >= %s", $start->format('Y-m-d H:i:s'));
+    if ($end)   $sql .= $wpdb->prepare(" AND {$column} < %s", $end->format('Y-m-d H:i:s'));
+    return $sql;
+}
+
+/**
+ * Derived table for usage totals: raw logs from the first fully retained day,
+ * daily summaries before it, so reports keep working after raw logs are purged.
+ * Use as "FROM {$source} l". Session markers are excluded.
+ */
+function aw_tracker_usage_source() {
+    global $wpdb;
+    $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
+    $table_summary = $wpdb->prefix . AW_TRACKER_TABLE_SUMMARY;
+    $boundary      = (string) get_option('aw_raw_complete_from', '');
+    $raw = "SELECT machine_identifier, os_user, application_name, is_idle, duration_seconds, logged_at
+            FROM {$table_logs} WHERE application_name <> 'System Session'";
+    if ($boundary === '') {
+        return "({$raw})";
+    }
+    return $wpdb->prepare("({$raw} AND logged_at >= %s
+        UNION ALL SELECT machine_identifier, os_user, application_name, 0, active_seconds, CAST(log_date AS DATETIME)
+            FROM {$table_summary} WHERE log_date < %s AND active_seconds > 0
+        UNION ALL SELECT machine_identifier, os_user, application_name, 1, idle_seconds, CAST(log_date AS DATETIME)
+            FROM {$table_summary} WHERE log_date < %s AND idle_seconds > 0)",
+        $boundary . ' 00:00:00', $boundary, $boundary);
 }
 
 // Helper: render the standard time-range <select> + optional custom date inputs
@@ -421,6 +654,7 @@ add_action('admin_post_aw_update_single_device', 'aw_tracker_handle_single_devic
 add_action('admin_post_aw_save_retention_settings', 'aw_tracker_handle_save_retention_settings');
 add_action('admin_post_aw_trigger_manual_maintenance', 'aw_tracker_handle_manual_maintenance');
 add_action('admin_post_aw_reregister_cron', 'aw_tracker_handle_reregister_cron');
+add_action('admin_post_aw_regenerate_api_token', 'aw_tracker_handle_regenerate_api_token');
 
 function aw_tracker_register_admin_menu() {
     add_menu_page(
