@@ -6,20 +6,48 @@
 
 param (
     [Parameter(Mandatory = $true)][string]$ServerEndpoint,
-    [Parameter(Mandatory = $true)][string]$ApiToken,
+    [string]$ApiToken         = "",
+    [string]$ApiTokenFile     = "",
     [string]$CaBundlePath     = "",
     [string]$NetworkSharePath = "C:\AW_Setup",
-    [int]$SyncIntervalSeconds = 1800
+    [int]$SyncIntervalSeconds = 1800,
+    [switch]$OnlyIfChanged
 )
+
+# For GPO: keep the token in a file on a restricted share (-ApiTokenFile)
+# instead of on the command line, which is stored in world-readable SYSVOL.
+if (-not $ApiToken -and $ApiTokenFile) {
+    if (!(Test-Path $ApiTokenFile)) { Write-Error "Token file not found: $ApiTokenFile"; exit 1 }
+    $ApiToken = (Get-Content -Path $ApiTokenFile -Raw).Trim()
+}
+if (-not $ApiToken) { Write-Error "Provide -ApiToken or -ApiTokenFile."; exit 1 }
 
 $InstallDir = "$env:ProgramFiles\ActivityWatch"
 $BridgeDir  = "$env:ProgramFiles\AWBridge"
 $DataDir    = "$env:ProgramData\AWBridge"
 $LogFile    = "$BridgeDir\deploy.log"
 
+if (!(Test-Path $BridgeDir)) { New-Item -ItemType Directory -Path $BridgeDir -Force | Out-Null }
+
 function Write-Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "$ts  $msg" | Tee-Object -FilePath $LogFile -Append | Write-Host
+}
+
+# For GPO startup scripts: do nothing when this PC already runs the current
+# agent with the same server and token, so normal reboots stay fast.
+if ($OnlyIfChanged) {
+    $ShareAgent = "$NetworkSharePath\aw_bridge_agent.py"
+    $LocalAgent = "$BridgeDir\aw_bridge_agent.py"
+    $LocalCfg   = "$DataDir\config.json"
+    if ((Test-Path $LocalAgent) -and (Test-Path $LocalCfg) -and (Test-Path $ShareAgent) -and
+        (Get-ScheduledTask -TaskName "ActivityWatch_Client_Service" -ErrorAction SilentlyContinue)) {
+        $Cfg = Get-Content $LocalCfg -Raw | ConvertFrom-Json
+        if (((Get-FileHash $ShareAgent).Hash -eq (Get-FileHash $LocalAgent).Hash) -and
+            $Cfg.server_url -eq $ServerEndpoint -and $Cfg.api_token -eq $ApiToken) {
+            exit 0
+        }
+    }
 }
 
 Write-Log "=== ActivityWatch Deployment Started on $env:COMPUTERNAME ==="

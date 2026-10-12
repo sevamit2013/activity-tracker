@@ -31,3 +31,22 @@ Devices tab: each machine appears with a recent Last Seen. Assign departments (C
 ## 4. Notes
 - User keys change from display name ("Amit P") to account name. Older rows keep the old name. To keep display names, add `"user_identity": "display"` to config.json.
 - Retention "Test Mode" now purges raw logs from before today (whole days only).
+
+## Windows: deploy to many PCs at once (shared folder + GPO)
+
+You do **not** copy files onto every PC. Fill one shared folder; each PC installs itself from it.
+
+1. On the server, create `C:\AW_Setup` and share it as `AW_Setup$`. Share and NTFS permissions: **Domain Computers = Read**, **Domain Admins = Full**.
+2. Put the client files in it: `ActivityWatch\`, `python\`, `aw_bridge_agent.py`, `run_service.cmd`, `deploy-aw-client.ps1`.
+3. Create `token.txt` in the share containing only the API token (from Devices & Settings). This keeps the token out of the GPO itself: GPO scripts live in SYSVOL, which every domain user can read.
+4. Group Policy Management → create a GPO linked to the OU holding the tracked PCs → Computer Configuration → Policies → Windows Settings → Scripts → **Startup** → Add:
+   - Script name: `powershell.exe`
+   - Script parameters:
+     ```
+     -NoProfile -ExecutionPolicy Bypass -File "\\SERVER\AW_Setup$\deploy-aw-client.ps1" -NetworkSharePath "\\SERVER\AW_Setup$" -ServerEndpoint "https://YOUR-SERVER/index.php/wp-json/activitywatch/v1/sync" -ApiTokenFile "\\SERVER\AW_Setup$\token.txt" -OnlyIfChanged
+     ```
+5. Reboot one test PC (or run `gpupdate /force`, then reboot). After a user logs on, check `C:\Program Files\AWBridge\deploy.log` and `C:\ProgramData\AWBridge\users\<user>\agent.log`.
+
+`-OnlyIfChanged` makes later reboots skip the install unless the agent file in the share, the server URL or the token changed. To update all PCs later, replace the files in the share (or the token in `token.txt`); each PC updates itself on its next reboot.
+
+No Active Directory domain (workgroup PCs)? GPO is not available. Instead, on each PC run the same command once from an Administrator PowerShell, pointing at the share. No file copying is needed. Alternatively use PDQ Deploy, Intune or PsExec.
