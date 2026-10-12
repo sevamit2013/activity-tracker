@@ -700,240 +700,193 @@ function aw_tracker_handle_manual_maintenance() {
     exit;
 }
 
-// 1. CSV Report Export Handler
+// 1. Report exports (CSV + XLSX share one builder so filters never drift)
 /**
  * Shared app/user/machine/department/time filter SQL for the export handlers,
- * built from the same query args the App Usage tab uses.
+ * built from the same query args the dashboard tabs use. A restricted user's
+ * department always overrides the department query arg.
  */
-function aw_tracker_export_filter_sql() {
+function aw_tracker_export_filter_sql($default_range = 'today') {
     global $wpdb;
 
     $sql         = '';
     $app_filter  = isset($_GET['app_name'])   ? sanitize_text_field($_GET['app_name'])   : '';
     $user_filter = isset($_GET['os_user'])    ? sanitize_text_field($_GET['os_user'])    : '';
     $mach_filter = isset($_GET['machine'])    ? sanitize_text_field($_GET['machine'])    : '';
-    $dept_arg    = isset($_GET['department']) ? sanitize_text_field($_GET['department']) : '';
-    $time_range  = isset($_GET['time_range']) ? sanitize_text_field($_GET['time_range']) : 'today';
+    $time_range  = isset($_GET['time_range']) ? sanitize_text_field($_GET['time_range']) : $default_range;
     $date_from   = isset($_GET['date_from'])  ? sanitize_text_field($_GET['date_from'])  : '';
     $date_to     = isset($_GET['date_to'])    ? sanitize_text_field($_GET['date_to'])    : '';
-
-    $dept_restriction = aw_tracker_get_user_department_restriction();
-    $dept = $dept_restriction ? $dept_restriction : $dept_arg;
 
     if ($app_filter)  $sql .= $wpdb->prepare(" AND l.application_name = %s", $app_filter);
     if ($user_filter) $sql .= $wpdb->prepare(" AND l.os_user = %s", $user_filter);
     if ($mach_filter) $sql .= $wpdb->prepare(" AND l.machine_identifier = %s", $mach_filter);
+    $dept = aw_tracker_export_department();
     if ($dept)        $sql .= $wpdb->prepare(" AND d.department = %s", $dept);
 
-    if ($time_range === '1h') {
-        $sql .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-    } elseif ($time_range === 'today') {
-        $sql .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-    } elseif ($time_range === 'yesterday') {
-        $sql .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('-1 day')), wp_date('Y-m-d 23:59:59', strtotime('-1 day')));
-    } elseif ($time_range === '24h') {
-        $sql .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-    } elseif ($time_range === '7d') {
-        $sql .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-    } elseif ($time_range === 'this_week') {
-        $sql .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00', strtotime('monday this week')));
-    } elseif ($time_range === 'last_week') {
-        $sql .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('monday last week')), wp_date('Y-m-d 23:59:59', strtotime('sunday last week')));
-    } elseif ($time_range === 'this_month') {
-        $sql .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-01 00:00:00'));
-    } elseif ($time_range === 'last_month') {
-        $sql .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-01 00:00:00', strtotime('first day of last month')), wp_date('Y-m-t 23:59:59', strtotime('last day of last month')));
-    } elseif ($time_range === 'custom' && $date_from && $date_to) {
-        $sql .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $date_from . ' 00:00:00', $date_to . ' 23:59:59');
-    }
-
-    return $sql;
+    return $sql . aw_tracker_time_sql($time_range, $date_from, $date_to);
 }
 
-function aw_tracker_handle_csv_export() {
-    if (!current_user_can('view_aw_reports')) wp_die('Unauthorized');
-    
+function aw_tracker_export_department() {
+    $restriction = aw_tracker_get_user_department_restriction();
+    if ($restriction) {
+        return $restriction;
+    }
+    return isset($_GET['department']) ? sanitize_text_field($_GET['department']) : '';
+}
+
+/** Returns array($title, $headers, $rows) for a report type using the current request filters. */
+function aw_tracker_build_report($report_type) {
     global $wpdb;
-    $report_type = isset($_GET['report_type']) ? sanitize_text_field($_GET['report_type']) : 'raw_logs';
-    $table_logs  = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
+    $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
     $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
-
-    $dept_filter = aw_tracker_get_user_department_restriction();
-
-    header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename=AW_Report_' . $report_type . '_' . date('Y-m-d') . '.csv');
-
-    $output = fopen('php://output', 'w');
+    $usage         = aw_tracker_usage_source();
+    $join          = "LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier";
+    $default_range = $report_type === 'user_across_pcs' ? 'all' : 'today';
+    $time_range    = isset($_GET['time_range']) ? sanitize_text_field($_GET['time_range']) : $default_range;
+    $date_from     = isset($_GET['date_from'])  ? sanitize_text_field($_GET['date_from'])  : '';
+    $date_to       = isset($_GET['date_to'])    ? sanitize_text_field($_GET['date_to'])    : '';
+    $range_label   = $time_range === 'custom' ? $date_from . ' to ' . $date_to : $time_range;
+    $filters       = aw_tracker_export_filter_sql($default_range);
+    $rows          = array();
 
     if ($report_type === 'low_pc_usage') {
-        fputcsv($output, array('Machine Hostname', 'Active Hours', 'Idle Hours', 'Total Logged Hours', 'Time Range Filter'));
-        $threshold  = isset($_GET['threshold']) ? floatval($_GET['threshold']) : 3.0;
-        $time_range = isset($_GET['time_range']) ? sanitize_text_field($_GET['time_range']) : 'today';
-
-        $where_clause = "WHERE 1=1";
-        if ($time_range === '1h') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-        } elseif ($time_range === 'today') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-        } elseif ($time_range === '24h') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-        } elseif ($time_range === '7d') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
+        $threshold = isset($_GET['threshold']) ? floatval($_GET['threshold']) : 3.0;
+        $results   = aw_tracker_low_pc_usage_rows($threshold, $time_range, $date_from, $date_to, aw_tracker_export_department(),
+                                                  isset($_GET['machine']) ? sanitize_text_field($_GET['machine']) : '');
+        foreach ($results as $r) {
+            $rows[] = array($r->machine_identifier, $r->active_hrs, $r->idle_hrs, round($r->active_hrs + $r->idle_hrs, 2), $range_label);
         }
+        return array('Low PC Usage', array('Machine Hostname', 'Active Hours', 'Idle Hours', 'Total Logged Hours', 'Time Range Filter'), $rows);
+    }
 
-        if ($dept_filter) {
-            $where_clause .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
-        }
-
-        $results = $wpdb->get_results($wpdb->prepare("
-            SELECT l.machine_identifier,
-                   ROUND(SUM(CASE WHEN l.is_idle = 0 THEN l.duration_seconds ELSE 0 END)/3600, 2) as active_hrs,
-                   ROUND(SUM(CASE WHEN l.is_idle = 1 THEN l.duration_seconds ELSE 0 END)/3600, 2) as idle_hrs,
-                   ROUND(SUM(l.duration_seconds)/3600, 2) as total_hrs
-            FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            $where_clause
-            GROUP BY l.machine_identifier
-            HAVING active_hrs < %f
-            ORDER BY active_hrs ASC
-        ", $threshold));
-
-        foreach ($results as $row) {
-            fputcsv($output, array($row->machine_identifier, $row->active_hrs, $row->idle_hrs, $row->total_hrs, $time_range));
-        }
-    } elseif ($report_type === 'low_app_usage') {
-        fputcsv($output, array('Application', 'Machine Hostname', 'OS User', 'Active Hours', 'Threshold (Hrs)', 'Time Range Filter'));
-        $app_filter = isset($_GET['app_name']) ? sanitize_text_field($_GET['app_name']) : '';
-        $threshold  = isset($_GET['threshold']) ? floatval($_GET['threshold']) : 2.0;
-        $time_range = isset($_GET['time_range']) ? sanitize_text_field($_GET['time_range']) : 'today';
-
-        $where_clause = "WHERE l.is_idle = 0";
-        if (!empty($app_filter)) {
-            $where_clause .= $wpdb->prepare(" AND l.application_name = %s", $app_filter);
-        }
-        if ($time_range === '1h') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-        } elseif ($time_range === 'today') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-        } elseif ($time_range === '24h') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-        } elseif ($time_range === '7d') {
-            $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-        }
-        if ($dept_filter) {
-            $where_clause .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
-        }
-
-        $results = $wpdb->get_results($wpdb->prepare("
-            SELECT l.application_name, l.machine_identifier, l.os_user,
-                   ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs
-            FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            $where_clause
+    if ($report_type === 'low_app_usage') {
+        $threshold = isset($_GET['threshold']) ? floatval($_GET['threshold']) : 2.0;
+        $results   = $wpdb->get_results($wpdb->prepare("
+            SELECT l.application_name, l.machine_identifier, l.os_user, ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs
+            FROM {$usage} l {$join}
+            WHERE l.is_idle = 0 AND l.application_name <> 'System Idle' {$filters}
             GROUP BY l.application_name, l.machine_identifier, l.os_user
             HAVING active_hrs < %f
             ORDER BY active_hrs ASC
         ", $threshold));
-
-        foreach ($results as $row) {
-            fputcsv($output, array($row->application_name, $row->machine_identifier, $row->os_user, $row->active_hrs, $threshold, $time_range));
+        foreach ($results as $r) {
+            $rows[] = array($r->application_name, $r->machine_identifier, $r->os_user, $r->active_hrs, $threshold, $range_label);
         }
-    } elseif ($report_type === 'user_across_pcs') {
-        fputcsv($output, array('OS User', 'Machine Hostname', 'Active Hours', 'Top Application'));
-        $where_clause = "WHERE l.is_idle = 0";
-        if ($dept_filter) {
-            $where_clause .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
-        }
+        return array('Low App Usage', array('Application', 'Machine Hostname', 'OS User', 'Active Hours', 'Threshold (Hrs)', 'Time Range Filter'), $rows);
+    }
 
-        $results = $wpdb->get_results("
-            SELECT l.os_user, l.machine_identifier,
-                   ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs,
-                   (
-                       SELECT top_app.application_name
-                       FROM {$table_logs} top_app
-                       WHERE top_app.os_user = l.os_user
-                         AND top_app.machine_identifier = l.machine_identifier
-                         AND top_app.is_idle = 0
-                         AND top_app.application_name NOT IN ('System Session','System Idle')
-                       GROUP BY top_app.application_name
-                       ORDER BY SUM(top_app.duration_seconds) DESC
-                       LIMIT 1
-                   ) as application_name
-            FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            $where_clause
+    if ($report_type === 'user_across_pcs') {
+        $top_time = aw_tracker_time_sql($time_range, $date_from, $date_to, 'top_app.logged_at');
+        $results  = $wpdb->get_results("
+            SELECT l.os_user, l.machine_identifier, ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs,
+                   (SELECT top_app.application_name FROM {$usage} top_app
+                     WHERE top_app.os_user = l.os_user AND top_app.machine_identifier = l.machine_identifier
+                       AND top_app.is_idle = 0 AND top_app.application_name <> 'System Idle' {$top_time}
+                     GROUP BY top_app.application_name ORDER BY SUM(top_app.duration_seconds) DESC LIMIT 1) as application_name
+            FROM {$usage} l {$join}
+            WHERE l.is_idle = 0 {$filters}
             GROUP BY l.os_user, l.machine_identifier
             ORDER BY l.os_user ASC, active_hrs DESC
         ");
-
-        foreach ($results as $row) {
-            fputcsv($output, array($row->os_user, $row->machine_identifier, $row->active_hrs, $row->application_name));
+        foreach ($results as $r) {
+            $rows[] = array($r->os_user, $r->machine_identifier, $r->active_hrs, $r->application_name);
         }
-    } elseif ($report_type === 'app_usage') {
-        $per_user   = isset($_GET['group_by']) && $_GET['group_by'] === 'user';
-        $time_range = isset($_GET['time_range']) ? sanitize_text_field($_GET['time_range']) : 'today';
-        $where_clause = "WHERE l.is_idle = 0 AND l.application_name NOT IN ('System Session','System Idle')";
-        $where_clause .= aw_tracker_export_filter_sql();
+        return array('Floating User Matrix', array('OS User', 'Machine Hostname', 'Active Hours', 'Top Application'), $rows);
+    }
 
-        if ($per_user) {
-            fputcsv($output, array('Application', 'OS User', 'Machine Hostname', 'Active Hours', 'Time Range Filter'));
+    if ($report_type === 'app_usage') {
+        $where = "WHERE l.is_idle = 0 AND l.application_name <> 'System Idle' {$filters}";
+        if (isset($_GET['group_by']) && $_GET['group_by'] === 'user') {
             $results = $wpdb->get_results("
-                SELECT l.application_name, l.os_user, l.machine_identifier,
-                       ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs
-                FROM {$table_logs} l
-                LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-                $where_clause
+                SELECT l.application_name, l.os_user, l.machine_identifier, ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs
+                FROM {$usage} l {$join} {$where}
                 GROUP BY l.application_name, l.os_user, l.machine_identifier
                 ORDER BY active_hrs DESC
             ");
-            foreach ($results as $row) {
-                fputcsv($output, array($row->application_name, $row->os_user, $row->machine_identifier, $row->active_hrs, $time_range));
+            foreach ($results as $r) {
+                $rows[] = array($r->application_name, $r->os_user, $r->machine_identifier, $r->active_hrs, $range_label);
             }
-        } else {
-            fputcsv($output, array('Application', 'Active Hours', 'Machines Used On', 'Distinct Users', 'Time Range Filter'));
-            $results = $wpdb->get_results("
-                SELECT l.application_name,
-                       ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs,
-                       COUNT(DISTINCT l.machine_identifier) as machine_count,
-                       COUNT(DISTINCT l.os_user) as user_count
-                FROM {$table_logs} l
-                LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-                $where_clause
-                GROUP BY l.application_name
-                ORDER BY active_hrs DESC
-            ");
-            foreach ($results as $row) {
-                fputcsv($output, array($row->application_name, $row->active_hrs, $row->machine_count, $row->user_count, $time_range));
-            }
-        }
-    } else {
-        fputcsv($output, array('Machine', 'OS User', 'OS Platform', 'Application', 'Window Title', 'Duration (Mins)', 'State', 'Logged At'));
-        $where_clause = "WHERE 1=1";
-        if ($dept_filter) {
-            $where_clause .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
+            return array('App Usage by User', array('Application', 'OS User', 'Machine Hostname', 'Active Hours', 'Time Range Filter'), $rows);
         }
         $results = $wpdb->get_results("
-            SELECT l.* 
-            FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            $where_clause
-            ORDER BY l.logged_at DESC LIMIT 5000
+            SELECT l.application_name, ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs,
+                   COUNT(DISTINCT l.machine_identifier) as machine_count, COUNT(DISTINCT l.os_user) as user_count
+            FROM {$usage} l {$join} {$where}
+            GROUP BY l.application_name
+            ORDER BY active_hrs DESC
         ");
-
-        foreach ($results as $row) {
-            fputcsv($output, array(
-                $row->machine_identifier,
-                $row->os_user,
-                $row->os_platform,
-                $row->application_name,
-                $row->window_title,
-                round($row->duration_seconds / 60, 1),
-                $row->is_idle ? 'Idle' : 'Active',
-                $row->logged_at
-            ));
+        foreach ($results as $r) {
+            $rows[] = array($r->application_name, $r->active_hrs, $r->machine_count, $r->user_count, $range_label);
         }
+        return array('App Usage', array('Application', 'Active Hours', 'Machines Used On', 'Distinct Users', 'Time Range Filter'), $rows);
     }
 
+    $results = $wpdb->get_results("
+        SELECT l.* FROM {$table_logs} l {$join}
+        WHERE 1=1 {$filters}
+        ORDER BY l.logged_at DESC LIMIT 20000
+    ");
+    foreach ($results as $r) {
+        $rows[] = array(
+            $r->machine_identifier, $r->os_user, $r->os_platform, $r->application_name, $r->window_title,
+            round($r->duration_seconds / 60, 1), $r->is_idle ? 'Idle' : 'Active', $r->logged_at
+        );
+    }
+    return array('Raw Logs', array('Machine', 'OS User', 'OS Platform', 'Application', 'Window Title', 'Duration (Mins)', 'State', 'Logged At'), $rows);
+}
+
+/** Registered devices (including ones with no activity at all) below the active-hours threshold. */
+function aw_tracker_low_pc_usage_rows($threshold, $time_range, $date_from, $date_to, $department = '', $machine = '') {
+    global $wpdb;
+    $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
+    $usage         = aw_tracker_usage_source();
+    $time_sql      = aw_tracker_time_sql($time_range, $date_from, $date_to);
+    $device_where  = 'WHERE 1=1';
+    if ($department) $device_where .= $wpdb->prepare(' AND d.department = %s', $department);
+    if ($machine)    $device_where .= $wpdb->prepare(' AND d.machine_identifier = %s', $machine);
+    return $wpdb->get_results($wpdb->prepare("
+        SELECT * FROM (
+            SELECT d.machine_identifier,
+                   ROUND(COALESCE(u.active_seconds, 0)/3600, 2) as active_hrs,
+                   ROUND(COALESCE(u.idle_seconds, 0)/3600, 2)   as idle_hrs
+            FROM {$table_devices} d
+            LEFT JOIN (
+                SELECT l.machine_identifier,
+                       SUM(CASE WHEN l.is_idle = 0 THEN l.duration_seconds ELSE 0 END) as active_seconds,
+                       SUM(CASE WHEN l.is_idle = 1 THEN l.duration_seconds ELSE 0 END) as idle_seconds
+                FROM {$usage} l
+                WHERE 1=1 {$time_sql}
+                GROUP BY l.machine_identifier
+            ) u ON u.machine_identifier = d.machine_identifier
+            {$device_where}
+        ) pcs
+        WHERE active_hrs < %f
+        ORDER BY active_hrs ASC
+    ", $threshold));
+}
+
+/** Prevent spreadsheet formula injection from user-controlled text. */
+function aw_tracker_spreadsheet_safe($value) {
+    if (is_string($value) && $value !== '' && strpos("=+-@\t\r", $value[0]) !== false && !is_numeric($value)) {
+        return "'" . $value;
+    }
+    return $value;
+}
+
+function aw_tracker_handle_csv_export() {
+    if (!current_user_can('view_aw_reports')) wp_die('Unauthorized');
+
+    $report_type = isset($_GET['report_type']) ? sanitize_key($_GET['report_type']) : 'raw_logs';
+    list(, $headers, $rows) = aw_tracker_build_report($report_type);
+
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename=AW_Report_' . $report_type . '_' . wp_date('Y-m-d') . '.csv');
+
+    $output = fopen('php://output', 'w');
+    fputcsv($output, $headers);
+    foreach ($rows as $row) {
+        fputcsv($output, array_map('aw_tracker_spreadsheet_safe', $row));
+    }
     fclose($output);
     exit;
 }
@@ -951,6 +904,7 @@ function aw_build_xlsx(array $headers, array $rows, string $sheet_title = 'Repor
     $string_index = [];
 
     $add_string = function(string $val) use (&$strings, &$string_index): int {
+        $val = preg_replace('/[^\x{9}\x{A}\x{D}\x{20}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u', '', wp_check_invalid_utf8($val, true)) ?? '';
         if (!isset($string_index[$val])) {
             $string_index[$val] = count($strings);
             $strings[]          = $val;
@@ -966,7 +920,7 @@ function aw_build_xlsx(array $headers, array $rows, string $sheet_title = 'Repor
     foreach ($rows as $row) {
         $cell_row = [];
         foreach ($row as $cell) {
-            if (is_numeric($cell) && $cell !== '') {
+            if (is_int($cell) || is_float($cell) || (is_string($cell) && preg_match('/^-?(0|[1-9]\d{0,14})(\.\d+)?$/', $cell))) {
                 $cell_row[] = ['type' => 'n', 'value' => $cell];
             } else {
                 $cell_row[] = ['type' => 's', 'value' => $add_string((string)$cell)];
@@ -1005,7 +959,14 @@ function aw_build_xlsx(array $headers, array $rows, string $sheet_title = 'Repor
     $styles .= '</styleSheet>';
 
     // ── 4. Build sheet1.xml ──────────────────────────────────────────────────
-    $col_letters = array_map(fn($i) => chr(65 + $i), range(0, count($headers) - 1));
+    $col_letters = array_map(function ($i) {
+        $letters = '';
+        for ($n = $i + 1; $n > 0; $n = intdiv($n - 1, 26)) {
+            $letters = chr(65 + ($n - 1) % 26) . $letters;
+        }
+        return $letters;
+    }, range(0, count($headers) - 1));
+    $sheet_title = substr(preg_replace('/[\[\]:*?\/\\]/', ' ', $sheet_title), 0, 31) ?: 'Report';
 
     $sheet  = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
     $sheet .= '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">';
@@ -1083,149 +1044,11 @@ function aw_build_xlsx(array $headers, array $rows, string $sheet_title = 'Repor
 
 function aw_tracker_handle_xlsx_export() {
     if (!current_user_can('view_aw_reports')) wp_die('Unauthorized');
+    if (!class_exists('ZipArchive')) wp_die('XLSX export needs the PHP zip extension. Use CSV export instead.');
 
-    global $wpdb;
-    $report_type   = isset($_GET['report_type']) ? sanitize_text_field($_GET['report_type']) : 'raw_logs';
-    $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
-    $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
-    $dept_filter   = aw_tracker_get_user_department_restriction();
+    $report_type = isset($_GET['report_type']) ? sanitize_key($_GET['report_type']) : 'raw_logs';
+    list($title, $headers, $rows) = aw_tracker_build_report($report_type);
 
-    // ── Build time-range where clause (same logic as dashboard) ──────────────
-    $time_range = isset($_GET['time_range']) ? sanitize_text_field($_GET['time_range']) : 'today';
-    $date_from  = isset($_GET['date_from'])  ? sanitize_text_field($_GET['date_from'])  : '';
-    $date_to    = isset($_GET['date_to'])    ? sanitize_text_field($_GET['date_to'])    : '';
-
-    $time_sql = '';
-    if ($time_range === '1h')         $time_sql = $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-    elseif ($time_range === 'today')  $time_sql = $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-    elseif ($time_range === 'yesterday') $time_sql = $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('-1 day')), wp_date('Y-m-d 23:59:59', strtotime('-1 day')));
-    elseif ($time_range === '24h')    $time_sql = $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-    elseif ($time_range === '7d')     $time_sql = $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-    elseif ($time_range === 'this_week')  $time_sql = $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00', strtotime('monday this week')));
-    elseif ($time_range === 'last_week')  $time_sql = $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('monday last week')), wp_date('Y-m-d 23:59:59', strtotime('sunday last week')));
-    elseif ($time_range === 'this_month') $time_sql = $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-01 00:00:00'));
-    elseif ($time_range === 'last_month') $time_sql = $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-01 00:00:00', strtotime('first day of last month')), wp_date('Y-m-t 23:59:59', strtotime('last day of last month')));
-    elseif ($time_range === 'custom' && $date_from && $date_to) $time_sql = $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $date_from . ' 00:00:00', $date_to . ' 23:59:59');
-
-    $dept_sql = $dept_filter ? $wpdb->prepare(" AND d.department = %s", $dept_filter) : '';
-
-    // ── Fetch data based on report type ──────────────────────────────────────
-    $headers = [];
-    $rows    = [];
-    $title   = 'AW Report';
-
-    if ($report_type === 'low_pc_usage') {
-        $title     = 'Low PC Usage Report';
-        $threshold = isset($_GET['threshold']) ? floatval($_GET['threshold']) : 3.0;
-        $headers   = ['Machine Hostname', 'Active Hours', 'Idle Hours', 'Total Logged Hours', 'Time Range'];
-        $results   = $wpdb->get_results($wpdb->prepare("
-            SELECT l.machine_identifier,
-                   ROUND(SUM(CASE WHEN l.is_idle=0 THEN l.duration_seconds ELSE 0 END)/3600,2) as active_hrs,
-                   ROUND(SUM(CASE WHEN l.is_idle=1 THEN l.duration_seconds ELSE 0 END)/3600,2) as idle_hrs,
-                   ROUND(SUM(l.duration_seconds)/3600,2) as total_hrs
-            FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            WHERE 1=1 {$dept_sql} {$time_sql}
-            GROUP BY l.machine_identifier HAVING active_hrs < %f ORDER BY active_hrs ASC
-        ", $threshold));
-        foreach ($results as $r) $rows[] = [$r->machine_identifier, $r->active_hrs, $r->idle_hrs, $r->total_hrs, $time_range];
-
-    } elseif ($report_type === 'low_app_usage') {
-        $title      = 'Low App Usage Report';
-        $threshold  = isset($_GET['threshold']) ? floatval($_GET['threshold']) : 2.0;
-        $app_filter = isset($_GET['app_name'])  ? sanitize_text_field($_GET['app_name']) : '';
-        $app_sql    = $app_filter ? $wpdb->prepare(" AND l.application_name = %s", $app_filter) : '';
-        $headers    = ['Application', 'Machine Hostname', 'OS User', 'Active Hours', 'Threshold (Hrs)', 'Time Range'];
-        $results    = $wpdb->get_results($wpdb->prepare("
-            SELECT l.application_name, l.machine_identifier, l.os_user,
-                   ROUND(SUM(l.duration_seconds)/3600,2) as active_hrs
-            FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            WHERE l.is_idle=0 {$app_sql} {$dept_sql} {$time_sql}
-            GROUP BY l.application_name, l.machine_identifier, l.os_user
-            HAVING active_hrs < %f ORDER BY active_hrs ASC
-        ", $threshold));
-        foreach ($results as $r) $rows[] = [$r->application_name, $r->machine_identifier, $r->os_user, $r->active_hrs, $threshold, $time_range];
-
-    } elseif ($report_type === 'app_usage') {
-        $title      = 'Application Usage Report';
-        $per_user   = isset($_GET['group_by']) && $_GET['group_by'] === 'user';
-        $filter_sql = aw_tracker_export_filter_sql();
-        $base_where = "WHERE l.is_idle=0 AND l.application_name NOT IN ('System Session','System Idle') {$filter_sql}";
-
-        if ($per_user) {
-            $title   = 'Application Usage by User Report';
-            $headers = ['Application', 'OS User', 'Machine Hostname', 'Active Hours'];
-            $results = $wpdb->get_results("
-                SELECT l.application_name, l.os_user, l.machine_identifier,
-                       ROUND(SUM(l.duration_seconds)/3600,2) as active_hrs
-                FROM {$table_logs} l
-                LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-                {$base_where}
-                GROUP BY l.application_name, l.os_user, l.machine_identifier
-                ORDER BY active_hrs DESC
-            ");
-            foreach ($results as $r) $rows[] = [$r->application_name, $r->os_user, $r->machine_identifier, $r->active_hrs];
-        } else {
-            $headers = ['Application', 'Active Hours', 'Machines', 'Users'];
-            $results = $wpdb->get_results("
-                SELECT l.application_name,
-                       ROUND(SUM(l.duration_seconds)/3600,2) as active_hrs,
-                       COUNT(DISTINCT l.machine_identifier) as machine_count,
-                       COUNT(DISTINCT l.os_user) as user_count
-                FROM {$table_logs} l
-                LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-                {$base_where}
-                GROUP BY l.application_name ORDER BY active_hrs DESC
-            ");
-            foreach ($results as $r) $rows[] = [$r->application_name, $r->active_hrs, $r->machine_count, $r->user_count];
-        }
-
-    } elseif ($report_type === 'user_across_pcs') {
-        $title   = 'Floating User Matrix Report';
-        $headers = ['OS / AD User', 'Machine Hostname', 'Active Hours', 'Primary Application'];
-        $results = $wpdb->get_results("
-            SELECT l.os_user, l.machine_identifier,
-                   ROUND(SUM(l.duration_seconds)/3600,2) as active_hrs,
-                   (
-                       SELECT top_app.application_name
-                       FROM {$table_logs} top_app
-                       WHERE top_app.os_user = l.os_user
-                         AND top_app.machine_identifier = l.machine_identifier
-                         AND top_app.is_idle = 0
-                         AND top_app.application_name NOT IN ('System Session','System Idle')
-                       GROUP BY top_app.application_name
-                       ORDER BY SUM(top_app.duration_seconds) DESC
-                       LIMIT 1
-                   ) as application_name
-            FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            WHERE l.is_idle=0 {$dept_sql}
-            GROUP BY l.os_user, l.machine_identifier ORDER BY l.os_user ASC, active_hrs DESC
-        ");
-        foreach ($results as $r) $rows[] = [$r->os_user, $r->machine_identifier, $r->active_hrs, $r->application_name];
-
-    } else {
-        // raw_logs
-        $title   = 'Raw Activity Logs Report';
-        $machine_filter = isset($_GET['machine']) ? sanitize_text_field($_GET['machine']) : '';
-        $machine_sql    = $machine_filter ? $wpdb->prepare(" AND l.machine_identifier = %s", $machine_filter) : '';
-        $headers = ['Machine', 'OS User', 'OS Platform', 'Application', 'Window Title', 'Duration (Mins)', 'State', 'Logged At'];
-        $results = $wpdb->get_results("
-            SELECT l.* FROM {$table_logs} l
-            LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-            WHERE 1=1 {$machine_sql} {$dept_sql} {$time_sql}
-            ORDER BY l.logged_at DESC LIMIT 5000
-        ");
-        foreach ($results as $r) $rows[] = [
-            $r->machine_identifier, $r->os_user, $r->os_platform,
-            $r->application_name, $r->window_title,
-            round($r->duration_seconds / 60, 1),
-            $r->is_idle ? 'Idle' : 'Active', $r->logged_at
-        ];
-    }
-
-    // ── Send as real .xlsx ────────────────────────────────────────────────────
     $xlsx_data = aw_build_xlsx($headers, $rows, $title);
     $filename  = 'AW_' . $report_type . '_' . wp_date('Y-m-d') . '.xlsx';
 
@@ -1240,6 +1063,7 @@ function aw_tracker_handle_xlsx_export() {
 // 2. Bulk CSV Device Onboarding Handler
 function aw_tracker_handle_bulk_device_csv_import() {
     if (!current_user_can('manage_options') && !current_user_can('manage_aw_tracker')) wp_die('Unauthorized');
+    check_admin_referer('aw_bulk_import_devices_nonce');
     global $wpdb;
 
     if (isset($_FILES['device_csv']) && $_FILES['device_csv']['error'] == 0) {
@@ -1280,6 +1104,7 @@ function aw_tracker_handle_bulk_device_csv_import() {
 // 3. Single Device Location Update Handler
 function aw_tracker_handle_single_device_update() {
     if (!current_user_can('manage_options') && !current_user_can('manage_aw_tracker')) wp_die('Unauthorized');
+    check_admin_referer('aw_update_single_device_nonce');
     global $wpdb;
 
     $machine    = sanitize_text_field($_POST['machine_identifier'] ?? '');
@@ -1300,6 +1125,23 @@ function aw_tracker_handle_single_device_update() {
     exit;
 }
 
+function aw_tracker_handle_regenerate_api_token() {
+    if (!current_user_can('manage_options') && !current_user_can('manage_aw_tracker')) wp_die('Unauthorized');
+    check_admin_referer('aw_regenerate_api_token_nonce');
+    update_option('aw_tracker_api_secret', wp_generate_password(40, false));
+    wp_redirect(admin_url('admin.php?page=activitywatch-tracker&tab=devices&token_regenerated=1'));
+    exit;
+}
+
+function aw_tracker_scope_join($dept_filter) {
+    global $wpdb;
+    if (!$dept_filter) {
+        return '';
+    }
+    $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
+    return $wpdb->prepare(" INNER JOIN {$table_devices} sd ON sd.machine_identifier = l.machine_identifier AND sd.department = %s", $dept_filter);
+}
+
 // ==================== DASHBOARD DISPLAY ====================
 function aw_tracker_render_admin_dashboard() {
     global $wpdb;
@@ -1315,6 +1157,7 @@ function aw_tracker_render_admin_dashboard() {
     $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
 
     $dept_filter = aw_tracker_get_user_department_restriction();
+    $table_usage = aw_tracker_usage_source();
 
     // Query Connected Devices (Scoped by department if Dept Admin)
     $devices_query = "SELECT * FROM {$table_devices}";
@@ -1333,37 +1176,7 @@ function aw_tracker_render_admin_dashboard() {
         $where_clause .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
     }
 
-    if ($time_range === '1h') {
-        $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-    } elseif ($time_range === 'today') {
-        $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-    } elseif ($time_range === 'yesterday') {
-        $yesterday_start = wp_date('Y-m-d 00:00:00', strtotime('-1 day'));
-        $yesterday_end   = wp_date('Y-m-d 23:59:59', strtotime('-1 day'));
-        $where_clause   .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $yesterday_start, $yesterday_end);
-    } elseif ($time_range === '24h') {
-        $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-    } elseif ($time_range === '7d') {
-        $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-    } elseif ($time_range === 'this_week') {
-        $week_start = wp_date('Y-m-d 00:00:00', strtotime('monday this week'));
-        $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", $week_start);
-    } elseif ($time_range === 'last_week') {
-        $lw_start = wp_date('Y-m-d 00:00:00', strtotime('monday last week'));
-        $lw_end   = wp_date('Y-m-d 23:59:59', strtotime('sunday last week'));
-        $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $lw_start, $lw_end);
-    } elseif ($time_range === 'this_month') {
-        $month_start = wp_date('Y-m-01 00:00:00');
-        $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", $month_start);
-    } elseif ($time_range === 'last_month') {
-        $lm_start = wp_date('Y-m-01 00:00:00', strtotime('first day of last month'));
-        $lm_end   = wp_date('Y-m-t 23:59:59',  strtotime('last day of last month'));
-        $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $lm_start, $lm_end);
-    } elseif ($time_range === 'custom' && !empty($date_from) && !empty($date_to)) {
-        $cf = sanitize_text_field($date_from) . ' 00:00:00';
-        $ct = sanitize_text_field($date_to)   . ' 23:59:59';
-        $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $cf, $ct);
-    }
+    $where_clause .= aw_tracker_time_sql($time_range, $date_from, $date_to);
     // 'all' → no date clause added
     ?>
 
@@ -1372,7 +1185,7 @@ function aw_tracker_render_admin_dashboard() {
             <span class="dashicons dashicons-chart-area" style="font-size:30px; width:30px; height:30px;"></span>
             ActivityWatch Central Enterprise Hub
         </h1>
-        <p>Enterprise PC, Floating User & Application Usage Analytics <?php if ($dept_filter) echo '— <strong>Scoped to Department: ' . esc_html($dept_filter) . '</strong>'; ?></p>
+        <p>Enterprise PC, Floating User & Application Usage Analytics <?php if ($dept_filter) echo $dept_filter === AW_TRACKER_NO_DEPARTMENT ? '— <strong style="color:#d63638;">No department is assigned to your account, so no data is shown. Ask an administrator to set your department.</strong>' : '— <strong>Scoped to Department: ' . esc_html($dept_filter) . '</strong>'; ?></p>
 
         <?php if (isset($_GET['pruned'])) : ?>
             <div class="notice notice-success is-dismissible">
@@ -1410,7 +1223,7 @@ function aw_tracker_render_admin_dashboard() {
         <?php if ($active_tab === 'dashboard') : 
             $top_apps = $wpdb->get_results("
                 SELECT l.application_name, SUM(l.duration_seconds) as total_seconds
-                FROM {$table_logs} l
+                FROM {$table_usage} l
                 LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                 $where_clause AND l.is_idle = 0
                 GROUP BY l.application_name ORDER BY total_seconds DESC LIMIT 7
@@ -1420,7 +1233,7 @@ function aw_tracker_render_admin_dashboard() {
                 SELECT 
                     SUM(CASE WHEN l.is_idle = 0 THEN l.duration_seconds ELSE 0 END) as active_seconds,
                     SUM(CASE WHEN l.is_idle = 1 THEN l.duration_seconds ELSE 0 END) as idle_seconds
-                FROM {$table_logs} l
+                FROM {$table_usage} l
                 LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                 $where_clause
             ");
@@ -1463,7 +1276,7 @@ function aw_tracker_render_admin_dashboard() {
                         <button type="submit" class="button button-primary">Filter Reports</button>
                     </form>
 
-                    <a href="<?php echo admin_url('admin-post.php?action=aw_export_csv&report_type=raw_logs'); ?>" class="button button-secondary" style="margin-left:auto;">
+                    <a href="<?php echo admin_url('admin-post.php?action=aw_export_csv&report_type=raw_logs&machine=' . urlencode($selected_machine) . '&time_range=' . urlencode($time_range) . '&date_from=' . urlencode($date_from) . '&date_to=' . urlencode($date_to)); ?>" class="button button-secondary" style="margin-left:auto;">
                         <span class="dashicons dashicons-download" style="margin-top:4px;"></span> Export CSV
                     </a>
                     <a href="<?php echo admin_url('admin-post.php?action=aw_export_xlsx&report_type=raw_logs&time_range=' . urlencode($time_range) . '&date_from=' . urlencode($date_from) . '&date_to=' . urlencode($date_to) . (!empty($selected_machine) ? '&machine=' . urlencode($selected_machine) : '')); ?>" class="button button-secondary" style="color:#217346;">
@@ -1491,7 +1304,7 @@ function aw_tracker_render_admin_dashboard() {
                 // Distinct users seen in filter window
                 $kpi_users = (int) $wpdb->get_var("
                     SELECT COUNT(DISTINCT l.os_user)
-                    FROM {$table_logs} l
+                    FROM {$table_usage} l
                     LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                     {$where_clause} AND l.os_user != 'Unknown'
                 ");
@@ -1535,6 +1348,8 @@ function aw_tracker_render_admin_dashboard() {
                                 'page' => 'activitywatch-tracker',
                                 'machine' => $selected_machine,
                                 'time_range' => $time_range,
+                                'date_from' => $date_from,
+                                'date_to' => $date_to,
                             ), admin_url('admin.php'));
                         ?>
                             <div class="tablenav-pages" style="margin:0;">
@@ -1633,39 +1448,9 @@ function aw_tracker_render_admin_dashboard() {
             if ($dept_filter) {
                 $where_clause .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
             }
-            if ($time_range === '1h') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-            } elseif ($time_range === 'today') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-            } elseif ($time_range === 'yesterday') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('-1 day')), wp_date('Y-m-d 23:59:59', strtotime('-1 day')));
-            } elseif ($time_range === '24h') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-            } elseif ($time_range === '7d') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-            } elseif ($time_range === 'this_week') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00', strtotime('monday this week')));
-            } elseif ($time_range === 'last_week') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('monday last week')), wp_date('Y-m-d 23:59:59', strtotime('sunday last week')));
-            } elseif ($time_range === 'this_month') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-01 00:00:00'));
-            } elseif ($time_range === 'last_month') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-01 00:00:00', strtotime('first day of last month')), wp_date('Y-m-t 23:59:59', strtotime('last day of last month')));
-            } elseif ($time_range === 'custom' && !empty($date_from) && !empty($date_to)) {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $date_from . ' 00:00:00', $date_to . ' 23:59:59');
-            }
+            $where_clause .= aw_tracker_time_sql($time_range, $date_from, $date_to);
 
-            $low_pcs = $wpdb->get_results($wpdb->prepare("
-                SELECT l.machine_identifier,
-                       ROUND(SUM(CASE WHEN l.is_idle = 0 THEN l.duration_seconds ELSE 0 END)/3600, 2) as active_hrs,
-                       ROUND(SUM(CASE WHEN l.is_idle = 1 THEN l.duration_seconds ELSE 0 END)/3600, 2) as idle_hrs
-                FROM {$table_logs} l
-                LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
-                $where_clause
-                GROUP BY l.machine_identifier
-                HAVING active_hrs < %f
-                ORDER BY active_hrs ASC
-            ", $threshold));
+            $low_pcs = aw_tracker_low_pc_usage_rows($threshold, $time_range, $date_from, $date_to, $dept_filter);
         ?>
             <div style="margin-top:20px; background:#fff; padding:20px; border:1px solid #ccd0d4; border-radius:8px;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; background:#f0f0f1; padding:12px; border-radius:6px;">
@@ -1730,7 +1515,7 @@ function aw_tracker_render_admin_dashboard() {
             $date_to    = isset($_GET['date_to'])    ? sanitize_text_field($_GET['date_to'])    : '';
 
             // Fetch distinct applications for dropdown filter
-            $available_apps = $wpdb->get_col("SELECT DISTINCT application_name FROM {$table_logs} WHERE application_name != 'System Session' ORDER BY application_name ASC LIMIT 50");
+            $available_apps = $wpdb->get_col("SELECT DISTINCT l.application_name FROM {$table_logs} l" . aw_tracker_scope_join($dept_filter) . " WHERE l.application_name != 'System Session' ORDER BY application_name ASC LIMIT 50");
 
             $where_clause = "WHERE l.is_idle = 0";
             if (!empty($app_filter)) {
@@ -1739,32 +1524,12 @@ function aw_tracker_render_admin_dashboard() {
             if ($dept_filter) {
                 $where_clause .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
             }
-            if ($time_range === '1h') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-            } elseif ($time_range === 'today') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-            } elseif ($time_range === 'yesterday') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('-1 day')), wp_date('Y-m-d 23:59:59', strtotime('-1 day')));
-            } elseif ($time_range === '24h') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-            } elseif ($time_range === '7d') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-            } elseif ($time_range === 'this_week') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00', strtotime('monday this week')));
-            } elseif ($time_range === 'last_week') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('monday last week')), wp_date('Y-m-d 23:59:59', strtotime('sunday last week')));
-            } elseif ($time_range === 'this_month') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-01 00:00:00'));
-            } elseif ($time_range === 'last_month') {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-01 00:00:00', strtotime('first day of last month')), wp_date('Y-m-t 23:59:59', strtotime('last day of last month')));
-            } elseif ($time_range === 'custom' && !empty($date_from) && !empty($date_to)) {
-                $where_clause .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $date_from . ' 00:00:00', $date_to . ' 23:59:59');
-            }
+            $where_clause .= aw_tracker_time_sql($time_range, $date_from, $date_to);
 
             $low_apps = $wpdb->get_results($wpdb->prepare("
                 SELECT l.application_name, l.machine_identifier, l.os_user,
                        ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs
-                FROM {$table_logs} l
+                FROM {$table_usage} l
                 LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                 $where_clause
                 GROUP BY l.application_name, l.machine_identifier, l.os_user
@@ -1854,31 +1619,11 @@ function aw_tracker_render_admin_dashboard() {
             if (!empty($au_app))     $au_where .= $wpdb->prepare(" AND l.application_name = %s", $au_app);
             if (!empty($au_user))    $au_where .= $wpdb->prepare(" AND l.os_user = %s", $au_user);
             if (!empty($au_machine)) $au_where .= $wpdb->prepare(" AND l.machine_identifier = %s", $au_machine);
-            if (!empty($au_dept) || $dept_filter) {
-                $d = !empty($au_dept) ? $au_dept : $dept_filter;
+            $d = $dept_filter ? $dept_filter : $au_dept;
+            if (!empty($d)) {
                 $au_where .= $wpdb->prepare(" AND d.department = %s", $d);
             }
-            if ($time_range === '1h') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-            } elseif ($time_range === 'today') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-            } elseif ($time_range === 'yesterday') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('-1 day')), wp_date('Y-m-d 23:59:59', strtotime('-1 day')));
-            } elseif ($time_range === '24h') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-            } elseif ($time_range === '7d') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-            } elseif ($time_range === 'this_week') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00', strtotime('monday this week')));
-            } elseif ($time_range === 'last_week') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('monday last week')), wp_date('Y-m-d 23:59:59', strtotime('sunday last week')));
-            } elseif ($time_range === 'this_month') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-01 00:00:00'));
-            } elseif ($time_range === 'last_month') {
-                $au_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-01 00:00:00', strtotime('first day of last month')), wp_date('Y-m-t 23:59:59', strtotime('last day of last month')));
-            } elseif ($time_range === 'custom' && !empty($date_from) && !empty($date_to)) {
-                $au_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $date_from . ' 00:00:00', $date_to . ' 23:59:59');
-            }
+            $au_where .= aw_tracker_time_sql($time_range, $date_from, $date_to);
 
             // App usage ranked
             $app_usage_rows = $wpdb->get_results("
@@ -1886,7 +1631,7 @@ function aw_tracker_render_admin_dashboard() {
                        ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs,
                        COUNT(DISTINCT l.machine_identifier)    as machine_count,
                        COUNT(DISTINCT l.os_user)               as user_count
-                FROM {$table_logs} l
+                FROM {$table_usage} l
                 LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                 {$au_where}
                 GROUP BY l.application_name
@@ -1897,7 +1642,7 @@ function aw_tracker_render_admin_dashboard() {
             $app_user_rows = $wpdb->get_results("
                 SELECT l.application_name, l.os_user, l.machine_identifier,
                        ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs
-                FROM {$table_logs} l
+                FROM {$table_usage} l
                 LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                 {$au_where}
                 GROUP BY l.application_name, l.os_user, l.machine_identifier
@@ -1911,7 +1656,7 @@ function aw_tracker_render_admin_dashboard() {
                 $app_drill = $wpdb->get_results("
                     SELECT l.machine_identifier, l.os_user,
                            ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs
-                    FROM {$table_logs} l
+                    FROM {$table_usage} l
                     LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                     {$au_where}
                     GROUP BY l.machine_identifier, l.os_user
@@ -1920,9 +1665,9 @@ function aw_tracker_render_admin_dashboard() {
             }
 
             // Filter options
-            $au_apps  = $wpdb->get_col("SELECT DISTINCT application_name FROM {$table_logs} WHERE application_name NOT IN ('System Session','System Idle') ORDER BY application_name ASC LIMIT 100");
-            $au_users = $wpdb->get_col("SELECT DISTINCT os_user FROM {$table_logs} WHERE os_user != 'Unknown' ORDER BY os_user ASC LIMIT 100");
-            $au_depts = $wpdb->get_col("SELECT DISTINCT department FROM {$table_devices} ORDER BY department ASC");
+            $au_apps  = $wpdb->get_col("SELECT DISTINCT l.application_name FROM {$table_logs} l" . aw_tracker_scope_join($dept_filter) . " WHERE l.application_name NOT IN ('System Session','System Idle') ORDER BY application_name ASC LIMIT 100");
+            $au_users = $wpdb->get_col("SELECT DISTINCT l.os_user FROM {$table_logs} l" . aw_tracker_scope_join($dept_filter) . " WHERE l.os_user != 'Unknown' ORDER BY os_user ASC LIMIT 100");
+            $au_depts = $dept_filter ? array($dept_filter) : $wpdb->get_col("SELECT DISTINCT department FROM {$table_devices} ORDER BY department ASC");
         ?>
             <div style="margin-top:20px; background:#fff; padding:20px; border:1px solid #ccd0d4; border-radius:8px;">
                 <div style="background:#f0f0f1; padding:12px; border-radius:6px; margin-bottom:20px;">
@@ -2103,27 +1848,7 @@ function aw_tracker_render_admin_dashboard() {
 
             if ($dept_filter) $ds_where .= $wpdb->prepare(" AND d.department = %s", $dept_filter);
 
-            if ($time_range === '1h') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-1 hour')));
-            } elseif ($time_range === 'today') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00'));
-            } elseif ($time_range === 'yesterday') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('-1 day')), wp_date('Y-m-d 23:59:59', strtotime('-1 day')));
-            } elseif ($time_range === '24h') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-24 hours')));
-            } elseif ($time_range === '7d') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d H:i:s', strtotime('-7 days')));
-            } elseif ($time_range === 'this_week') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-d 00:00:00', strtotime('monday this week')));
-            } elseif ($time_range === 'last_week') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-d 00:00:00', strtotime('monday last week')), wp_date('Y-m-d 23:59:59', strtotime('sunday last week')));
-            } elseif ($time_range === 'this_month') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at >= %s", wp_date('Y-m-01 00:00:00'));
-            } elseif ($time_range === 'last_month') {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", wp_date('Y-m-01 00:00:00', strtotime('first day of last month')), wp_date('Y-m-t 23:59:59', strtotime('last day of last month')));
-            } elseif ($time_range === 'custom' && !empty($date_from) && !empty($date_to)) {
-                $ds_where .= $wpdb->prepare(" AND l.logged_at BETWEEN %s AND %s", $date_from . ' 00:00:00', $date_to . ' 23:59:59');
-            }
+            $ds_where .= aw_tracker_time_sql($time_range, $date_from, $date_to);
 
             // Per-department aggregated stats
             $dept_stats = $wpdb->get_results("
@@ -2132,7 +1857,7 @@ function aw_tracker_render_admin_dashboard() {
                        COUNT(DISTINCT l.os_user)               as total_users,
                        ROUND(SUM(CASE WHEN l.is_idle=0 THEN l.duration_seconds ELSE 0 END)/3600, 2) as active_hrs,
                        ROUND(SUM(CASE WHEN l.is_idle=1 THEN l.duration_seconds ELSE 0 END)/3600, 2) as idle_hrs
-                FROM {$table_logs} l
+                FROM {$table_usage} l
                 LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                 {$ds_where}
                 GROUP BY d.department
@@ -2146,7 +1871,7 @@ function aw_tracker_render_admin_dashboard() {
                 $top = $wpdb->get_results($wpdb->prepare("
                     SELECT l.application_name,
                            ROUND(SUM(l.duration_seconds)/3600,2) as hrs
-                    FROM {$table_logs} l
+                    FROM {$table_usage} l
                     LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                     {$ds_where} AND d.department = %s AND l.is_idle = 0
                       AND l.application_name NOT IN ('System Session','System Idle')
@@ -2233,7 +1958,7 @@ function aw_tracker_render_admin_dashboard() {
                        ROUND(SUM(l.duration_seconds)/3600, 2) as active_hrs,
                        (
                            SELECT top_app.application_name 
-                           FROM {$table_logs} top_app 
+                           FROM {$table_usage} top_app 
                            WHERE top_app.os_user = l.os_user 
                              AND top_app.machine_identifier = l.machine_identifier 
                              AND top_app.is_idle = 0 
@@ -2242,7 +1967,7 @@ function aw_tracker_render_admin_dashboard() {
                            ORDER BY SUM(top_app.duration_seconds) DESC 
                            LIMIT 1
                        ) as application_name
-                FROM {$table_logs} l
+                FROM {$table_usage} l
                 LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
                 $where_clause
                 GROUP BY l.os_user, l.machine_identifier
@@ -2343,7 +2068,7 @@ function aw_tracker_render_admin_dashboard() {
                         <div>
                             <label><strong>Raw Activity Logs Retention (Table: <code>wp_aw_activity_logs</code>):</strong></label><br>
                             <select name="raw_retention_setting" style="margin-top:5px;">
-                                <option value="2_hours" <?php selected($raw_setting, '2_hours'); ?>>2 Hours (Test Mode)</option>
+                                <option value="2_hours" <?php selected($raw_setting, '2_hours'); ?>>Test Mode (purge raw logs before today)</option>
                                 <option value="3_months" <?php selected($raw_setting, '3_months'); ?>>3 Months</option>
                                 <option value="6_months" <?php selected($raw_setting, '6_months'); ?>>6 Months (Recommended)</option>
                                 <option value="12_months" <?php selected($raw_setting, '12_months'); ?>>12 Months (1 Year)</option>
@@ -2414,7 +2139,13 @@ function aw_tracker_render_admin_dashboard() {
                     </tr>
                     <tr>
                         <th>API Bearer Secret Token:</th>
-                        <td><code><?php echo esc_html($secret_token); ?></code></td>
+                        <td><code><?php echo esc_html($secret_token); ?></code>
+                            <form method="POST" action="<?php echo admin_url('admin-post.php'); ?>" style="display:inline; margin-left:10px;" onsubmit="return confirm('Every client must be redeployed with the new token. Continue?');">
+                                <input type="hidden" name="action" value="aw_regenerate_api_token">
+                                <?php wp_nonce_field('aw_regenerate_api_token_nonce'); ?>
+                                <button type="submit" class="button button-small">Regenerate token</button>
+                            </form>
+                        </td>
                     </tr>
                 </table>
             </div>
@@ -2424,6 +2155,7 @@ function aw_tracker_render_admin_dashboard() {
                 <h3>Bulk Device Onboarding via CSV</h3>
                 <form method="POST" action="<?php echo admin_url('admin-post.php'); ?>" enctype="multipart/form-data" style="background:#f0f0f1; padding:15px; border-radius:6px;">
                     <input type="hidden" name="action" value="aw_bulk_import_devices">
+                    <?php wp_nonce_field('aw_bulk_import_devices_nonce'); ?>
                     <label><strong>Select Devices CSV File:</strong></label>
                     <input type="file" name="device_csv" accept=".csv" required>
                     <button type="submit" class="button button-primary">Upload & Bulk Update Locations</button>
@@ -2457,6 +2189,7 @@ function aw_tracker_render_admin_dashboard() {
                                 <tr>
                                     <form method="POST" action="<?php echo admin_url('admin-post.php'); ?>">
                                         <input type="hidden" name="action" value="aw_update_single_device">
+                                        <?php wp_nonce_field('aw_update_single_device_nonce'); ?>
                                         <input type="hidden" name="machine_identifier" value="<?php echo esc_attr($dev->machine_identifier); ?>">
                                         <td><strong><code><?php echo esc_html($dev->machine_identifier); ?></code></strong></td>
                                         <td><input type="text" name="ashram" value="<?php echo esc_attr($dev->ashram); ?>" style="width:100%;"></td>
