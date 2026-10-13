@@ -196,4 +196,36 @@ assert any(".corrupt-" in n for n in os.listdir(TMP))
 # 9. Session events carry zero duration.
 assert ns["session_event"]("User Login")["duration"] == 0
 
+# 10. Activity from before a user switch that was not uploaded yet is still sent
+#     after switching back; the other user's time in between is excluded.
+ns["start_aw_stack"] = lambda: None
+ns["record_console_ownership"] = lambda since: None
+T = BASE + 10000
+AW["window"].append(aw_event(9100, T, 200, {"app": "chrome.exe", "title": "before switch"}))
+AW["window"].append(aw_event(9101, T + 400, 300, {"app": "EXCEL.EXE", "title": "across switch back"}))
+owned_before = ns["state"]["owned_since"]
+ns["state"]["away_since"] = T + 250
+FIXED_NOW[0] = T + 600
+WP["received"].clear()
+ns["on_console_gained"]()
+assert ns["state"]["owned_since"] == owned_before
+FIXED_NOW[0] = T + 1000
+ns["run_sync"]()
+got = by_title(delivered())
+assert got["before switch"]["duration"] == 200, got
+assert got["across switch back"]["duration"] == 100, got
+
+# 11. A config.json written after the agent started is picked up without a restart.
+saved = (ns["CONFIG_FILE"], ns["WP_API_URL"], ns["WP_API_TOKEN"])
+cfg = os.path.join(TMP, "late_config.json")
+ns["CONFIG_FILE"] = cfg
+ns["WP_API_URL"], ns["WP_API_TOKEN"] = "", ""
+ns["_config_loaded_mtime"] = None
+assert ns["server_configured"]() is False
+with open(cfg, "w") as h:
+    json.dump({"server_url": saved[1], "api_token": "late-token"}, h)
+assert ns["server_configured"]() is True
+assert ns["WP_API_TOKEN"] == "late-token" and ns["WP_API_URL"] == saved[1]
+ns["CONFIG_FILE"], ns["WP_API_URL"], ns["WP_API_TOKEN"] = saved
+
 print("all v3 sync checks passed")

@@ -14,7 +14,7 @@
    .\deploy-aw-client.ps1 -NetworkSharePath "C:\AW_Setup" -ServerEndpoint "https://<server>/index.php/wp-json/activitywatch/v1/sync" -ApiToken "<token>" [-CaBundlePath "C:\AW_Setup\ca.pem"]
    Start-ScheduledTask -TaskName "ActivityWatch_Client_Service"
    ```
-3. Check: `C:\ProgramData\AWBridge\config.json` exists, and `C:\ProgramData\AWBridge\users\<user>\agent.log` shows `Bridge agent 3.0.0 started` and `Delivered N records`.
+3. Check: `C:\ProgramData\AWBridge\config.json` exists, and `C:\ProgramData\AWBridge\users\<user>\agent.log` shows `Bridge agent 3.0.1 started` and `Delivered N records`.
 4. Shared PC test: user A uses Chrome, switch user, user B uses Ulaa, switch back. B's log should say "taking ownership"; A's log should say "releasing ActivityWatch". App Usage (Today) should show Chrome under A and Ulaa under B.
 5. Mass rollout: copy `C:\AW_Setup` to a share and run the same command from a GPO startup script, PDQ, or Intune.
 

@@ -54,6 +54,11 @@ Write-Log "=== ActivityWatch Deployment Started on $env:COMPUTERNAME ==="
 
 # ── 1. Terminate Running Processes (Must run BEFORE copying to prevent file locks) ──
 Write-Log "Stopping running ActivityWatch and bridge processes if active..."
+# Stop the run_service.cmd restart loops first; otherwise they respawn the agent
+# mid-install, before config.json is written, and that agent never uploads.
+Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*run_service.cmd*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Stop-Process -Name "aw-qt", "aw-server", "aw-server-rust", "aw-watcher-afk", "aw-watcher-window" -Force -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*aw_bridge_agent.py*" } |

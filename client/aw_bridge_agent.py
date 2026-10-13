@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = "3.0.0"
+AGENT_VERSION = "3.0.1"
 OS_PLATFORM = platform.system()
 
 
@@ -581,8 +581,38 @@ def http_json(url, payload=None, method="POST", timeout=30):
         return status, None, body[:200].decode("utf-8", "replace")
 
 
+def _config_mtime():
+    try:
+        return os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        return None
+
+
+_config_loaded_mtime = _config_mtime()
+
+
+def reload_config_if_changed():
+    """Pick up a config.json written or edited after the agent started."""
+    global CONFIG, WP_API_URL, WP_API_TOKEN, _config_loaded_mtime, _not_configured_logged, _tls_warning_logged
+    mtime = _config_mtime()
+    if mtime is None or mtime == _config_loaded_mtime:
+        return
+    _config_loaded_mtime = mtime
+    new_config = load_config(CONFIG_FILE)
+    new_url = str(new_config.get("server_url") or "").strip()
+    new_token = str(new_config.get("api_token") or "").strip()
+    changed = (new_url, new_token) != (WP_API_URL, WP_API_TOKEN)
+    CONFIG = new_config
+    WP_API_URL, WP_API_TOKEN = new_url, new_token
+    if changed:
+        _not_configured_logged = False
+        _tls_warning_logged = False
+        log("Reloaded %s (server settings changed)." % CONFIG_FILE)
+
+
 def server_configured():
     global _not_configured_logged, _tls_warning_logged
+    reload_config_if_changed()
     if not WP_API_URL or not WP_API_TOKEN:
         if not _not_configured_logged:
             log("server_url/api_token missing in %s; nothing will be uploaded." % CONFIG_FILE)
@@ -892,7 +922,10 @@ def stop_aw_stack():
 
 # ==================== EVENT CONVERSION ====================
 def prune_away_intervals():
+    # Keep every interval ActivityWatch events might still be read against.
     cutoff = time.time() - AWAY_HISTORY_SECONDS
+    oldest_unread = min([cp for cp in (state["window_checkpoint"], state["afk_checkpoint"]) if cp is not None] or [cutoff])
+    cutoff = min(cutoff, oldest_unread - AFK_LOOKBACK_SECONDS)
     state["away_intervals"] = [(s, e) for s, e in state["away_intervals"] if e > cutoff]
 
 
@@ -960,10 +993,22 @@ def build_records(window_events, afk_events, window_bucket, afk_bucket):
     return records
 
 
+_last_collect_issue = None
+
+
+def note_collect_issue(issue):
+    """Log why ActivityWatch could not be read, once per distinct reason."""
+    global _last_collect_issue
+    if issue and issue != _last_collect_issue:
+        log(issue)
+    _last_collect_issue = issue
+
+
 def collect_new_records():
     """Read ActivityWatch since the checkpoints. Returns (records, window_cp, afk_cp) or None."""
     global foreign_server_logged
     if not aw_server_alive():
+        note_collect_issue("ActivityWatch is not answering on port 5600; will retry next cycle.")
         return None
     if aw_port_owned_by_this_user() is False:
         if not foreign_server_logged:
@@ -974,6 +1019,7 @@ def collect_new_records():
 
     window_bucket, afk_bucket = get_aw_buckets()
     if not window_bucket or not afk_bucket:
+        note_collect_issue("ActivityWatch has no window/AFK buckets yet (window=%s, afk=%s)." % (window_bucket, afk_bucket))
         return None
 
     now = time.time()
@@ -989,17 +1035,21 @@ def collect_new_records():
         return None
 
     records = build_records(window_events, afk_events, window_bucket, afk_bucket)
+    note_collect_issue(None)
 
     new_window_cp = max([s for _, s, _, _ in window_events if s >= window_from - 0.5] or [state["window_checkpoint"]] or [None])
     new_afk_cp = max([s for _, s, _, _ in afk_events if s >= afk_from - 0.5] or [state["afk_checkpoint"]] or [None])
     return records, new_window_cp, new_afk_cp
 
 
-def run_sync():
+def run_sync(reason=""):
     if not server_configured():
         return
     fetch_server_config()
     collected = collect_new_records()
+    if reason:
+        log("%s: %s" % (reason, "ActivityWatch not readable" if collected is None
+                        else "%d new/updated records" % len(collected[0])))
     if collected is not None:
         records, window_cp, afk_cp = collected
         pending.update(records)
@@ -1035,9 +1085,13 @@ def report_interrupted_session():
 def on_console_gained():
     now = time.time()
     if state["away_since"] is not None:
+        # owned_since stays put: activity from before the switch that was not
+        # uploaded yet must still be readable. The away interval excludes the
+        # other user's time.
         state["away_intervals"].append((state["away_since"], now))
         state["away_since"] = None
-        state["owned_since"] = now
+        if not state["owned_since"]:
+            state["owned_since"] = state["away_intervals"][-1][1]
     elif not state["owned_since"] or other_user_took_console_since(state["owned_since"]):
         state["owned_since"] = now
     else:
@@ -1052,7 +1106,7 @@ def on_console_gained():
 
 def on_console_lost():
     log("Session switched away; releasing ActivityWatch.")
-    run_sync()
+    run_sync("Upload before switch")
     stop_aw_stack()
     if state["away_since"] is None:
         state["away_since"] = time.time()
@@ -1099,6 +1153,7 @@ def main():
     last_sync = 0.0
     while True:
         time.sleep(POLL_INTERVAL_SECONDS)
+        reload_config_if_changed()
         console_now = is_active_console_session()
 
         if console_now and not has_console:
