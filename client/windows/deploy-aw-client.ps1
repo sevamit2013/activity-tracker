@@ -10,7 +10,7 @@ param (
     [string]$ApiTokenFile     = "",
     [string]$CaBundlePath     = "",
     [string]$NetworkSharePath = "C:\AW_Setup",
-    [int]$SyncIntervalSeconds = 1800,
+    [int]$SyncIntervalSeconds = 300,
     [switch]$OnlyIfChanged
 )
 

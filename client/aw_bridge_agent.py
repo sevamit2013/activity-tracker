@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
     "api_token": "",
     "verify_tls": True,
     "ca_bundle": "",
-    "sync_interval_seconds": 1800,
+    "sync_interval_seconds": 300,
     "idle_threshold_seconds": 300,
     "user_identity": "account",
 }
@@ -103,7 +103,7 @@ CONFIG = load_config(CONFIG_FILE)
 WP_API_URL = str(CONFIG.get("server_url") or "").strip()
 WP_API_TOKEN = str(CONFIG.get("api_token") or "").strip()
 AW_LOCAL_URL = "http://localhost:5600/api/0"
-SYNC_INTERVAL_SECONDS = int(CONFIG.get("sync_interval_seconds") or 1800)
+SYNC_INTERVAL_SECONDS = int(CONFIG.get("sync_interval_seconds") or 300)
 IDLE_THRESHOLD_SECONDS = int(CONFIG.get("idle_threshold_seconds") or 300)
 
 POLL_INTERVAL_SECONDS = 5

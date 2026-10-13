@@ -3,7 +3,7 @@
  * Plugin Name: ActivityWatch WordPress Tracker
  * Plugin URI:  https://github.com/activitytrack/activitywatch-wp-tracker
  * Description: Enterprise usage tracking system. Aggregates desktop activity across LAN PCs, floating users, departments, and applications.
- * Version:     1.6.0
+ * Version:     1.6.1
  * Author:      Amit Pailwan
  * Text Domain: aw-wp-tracker
  */
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('AW_TRACKER_VERSION', '1.6.0');
+define('AW_TRACKER_VERSION', '1.6.1');
 define('AW_TRACKER_DB_VERSION', '1.6.0');
 define('AW_TRACKER_NO_DEPARTMENT', '__no_department_assigned__');
 define('AW_TRACKER_TABLE_LOGS', 'aw_activity_logs');
@@ -248,7 +248,7 @@ function aw_tracker_register_rest_routes() {
 function aw_tracker_handle_config_request($request) {
     return new WP_REST_Response(array(
         'idle_threshold_seconds' => (int) get_option('aw_idle_threshold_seconds', 300),
-        'sync_interval_seconds'  => 1800,
+        'sync_interval_seconds'  => (int) apply_filters('aw_tracker_sync_interval_seconds', 300),
         'server_version'         => AW_TRACKER_VERSION,
     ), 200);
 }
@@ -293,14 +293,13 @@ function aw_tracker_resolve_machine_identifier($hostname, $machine_uuid) {
     return substr($hostname, 0, 92) . '-' . substr(preg_replace('/[^a-z0-9]/', '', $machine_uuid), 0, 6);
 }
 
-/** Split [start, start+duration) at WordPress-local midnights. */
+/** Split a wall-clock span (seconds, local time read as UTC) at local midnights. */
 function aw_tracker_split_at_midnight($start, $duration) {
-    $tz     = wp_timezone();
     $end    = $start + $duration;
     $cursor = $start;
     $pieces = array();
     do {
-        $next_midnight = (new DateTimeImmutable('@' . $cursor))->setTimezone($tz)->setTime(0, 0)->modify('+1 day')->getTimestamp();
+        $next_midnight = (intdiv($cursor, 86400) + 1) * 86400;
         $piece_end = min($end, $next_midnight);
         $pieces[]  = array($cursor, $piece_end - $cursor);
         $cursor    = $piece_end;
@@ -353,20 +352,28 @@ function aw_tracker_handle_sync_payload($request) {
             continue;
         }
 
-        if (isset($event['ts']) && is_numeric($event['ts']) && $event['ts'] > 946684800) {
-            $start = (int) $event['ts'];
-        } else {
-            $parsed = isset($event['logged_at']) ? DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', (string) $event['logged_at'], $tz) : false;
-            if (!$parsed) {
-                $accepted++;
-                $skipped++;
-                continue;
+        // Store the PC's own clock time (as agents up to v2 did), so new rows line
+        // up with older rows and with the time users see on screen. Without a
+        // local time, fall back to the epoch in the WordPress timezone.
+        $wall = false;
+        if (isset($event['logged_at'])) {
+            $parsed = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', (string) $event['logged_at'], new DateTimeZone('UTC'));
+            if ($parsed) {
+                $wall = $parsed->getTimestamp();
             }
-            $start = $parsed->getTimestamp();
+        }
+        if ($wall === false && isset($event['ts']) && is_numeric($event['ts']) && $event['ts'] > 946684800) {
+            $epoch = (int) $event['ts'];
+            $wall  = $epoch + $tz->getOffset(new DateTimeImmutable('@' . $epoch));
+        }
+        if ($wall === false) {
+            $accepted++;
+            $skipped++;
+            continue;
         }
 
-        foreach (aw_tracker_split_at_midnight($start, $duration) as $index => $piece) {
-            $logged_at = wp_date('Y-m-d H:i:s', $piece[0]);
+        foreach (aw_tracker_split_at_midnight($wall, $duration) as $index => $piece) {
+            $logged_at = gmdate('Y-m-d H:i:s', $piece[0]);
             $seconds   = (int) $piece[1];
 
             if ($uid !== '') {

@@ -22,3 +22,8 @@ Not changed on purpose: window titles are still collected, uploaded, stored, sho
 | Devices with no activity missing from Low PC Usage | The report now starts from the device registry with a LEFT JOIN. |
 | Spreadsheet issues | Formula-injection guard on cells that start with `= + - @`. Invalid XML characters are stripped. Column letters work past Z. Numbers are detected more strictly. Sheet names are sanitised. ZipArchive is checked first. |
 | Hard-coded token / HTTP | The token and URL live in `config.json` (users can read it but not edit it), not in the code. HTTPS and a custom CA are supported, and the agent warns when it is on plain HTTP. Rotate the token with the new button. |
+
+## 1.6.1 (plugin): user-switch test follow-up
+- **Times are stored in the PC's own clock again**, as agents up to v2 did. 1.6.0 converted each event to the WordPress timezone, so when WordPress's timezone differs from the PCs' (for example WordPress left on UTC), new rows were shifted by hours and appeared mixed in with, or before, older rows. Events crossing local midnight are still split per day. Agents that send no local time fall back to the WordPress timezone.
+- **Uploads every 5 minutes** instead of 30 (server `/config` now returns `sync_interval_seconds = 300`; change with the `aw_tracker_sync_interval_seconds` filter). Agents pick this up on their next sync, so no client redeploy is needed. A user switch still uploads immediately.
+- Set WordPress → Settings → General → Timezone to the same timezone as the PCs so "Today" / "Last 1 hour" start at the right moment.

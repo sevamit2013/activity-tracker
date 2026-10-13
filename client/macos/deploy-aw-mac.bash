@@ -3,7 +3,7 @@
 #   sudo ./deploy-aw-mac.bash --server https://tracker.lan/index.php/wp-json/activitywatch/v1/sync --token <API_TOKEN> [--ca /path/ca.pem] [--setup /path/to/AW_Setup]
 set -euo pipefail
 
-SERVER=""; TOKEN=""; CA=""; SETUP_DIR="$(cd "$(dirname "$0")" && pwd)"; INTERVAL=1800
+SERVER=""; TOKEN=""; CA=""; SETUP_DIR="$(cd "$(dirname "$0")" && pwd)"; INTERVAL=300
 while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="$2"; shift 2;;
