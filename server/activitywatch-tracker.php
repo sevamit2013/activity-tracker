@@ -3,7 +3,7 @@
  * Plugin Name: ActivityWatch WordPress Tracker
  * Plugin URI:  https://github.com/activitytrack/activitywatch-wp-tracker
  * Description: Enterprise usage tracking system. Aggregates desktop activity across LAN PCs, floating users, departments, and applications.
- * Version:     1.6.1
+ * Version:     1.7.0
  * Author:      Amit Pailwan
  * Text Domain: aw-wp-tracker
  */
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('AW_TRACKER_VERSION', '1.6.1');
+define('AW_TRACKER_VERSION', '1.7.0');
 define('AW_TRACKER_DB_VERSION', '1.6.0');
 define('AW_TRACKER_NO_DEPARTMENT', '__no_department_assigned__');
 define('AW_TRACKER_TABLE_LOGS', 'aw_activity_logs');
@@ -756,6 +756,23 @@ function aw_tracker_build_report($report_type) {
     $filters       = aw_tracker_export_filter_sql($default_range);
     $rows          = array();
 
+    if ($report_type === 'sessions') {
+        $result = aw_tracker_session_rows(
+            $time_range, $date_from, $date_to,
+            isset($_GET['machine']) ? sanitize_text_field($_GET['machine']) : '',
+            isset($_GET['os_user']) ? sanitize_text_field($_GET['os_user']) : '',
+            aw_tracker_export_department(),
+            5000
+        );
+        foreach ($result['rows'] as $session) {
+            $rows[] = array(
+                $session['machine'], $session['user'], $session['login'], $session['logout'], $session['end'],
+                round($session['duration'] / 60, 1), round($session['active_seconds'] / 60, 1), $session['status']
+            );
+        }
+        return array('Login Sessions', array('Machine', 'OS User', 'Login', 'Logout', 'Session End', 'Session (Mins)', 'Active (Mins)', 'Status'), $rows);
+    }
+
     if ($report_type === 'low_pc_usage') {
         $threshold = isset($_GET['threshold']) ? floatval($_GET['threshold']) : 3.0;
         $results   = aw_tracker_low_pc_usage_rows($threshold, $time_range, $date_from, $date_to, aw_tracker_export_department(),
@@ -873,6 +890,112 @@ function aw_tracker_low_pc_usage_rows($threshold, $time_range, $date_from, $date
 }
 
 /** Prevent spreadsheet formula injection from user-controlled text. */
+function aw_tracker_format_duration($seconds) {
+    $seconds = max(0, (int) $seconds);
+    $hours   = intdiv($seconds, 3600);
+    $minutes = intdiv($seconds % 3600, 60);
+    return $hours > 0 ? sprintf('%dh %02dm', $hours, $minutes) : sprintf('%dm', $minutes);
+}
+
+/**
+ * Login sessions rebuilt from the agents' "System Session" markers. A User Login is
+ * closed by the same user's next User Logout or Session Interrupted on that PC.
+ * A login followed by another login, or by nothing, has no recorded logout; its end
+ * is the user's last activity on that PC. Returns array('rows' => ..., 'truncated' => bool).
+ */
+function aw_tracker_session_rows($time_range, $date_from, $date_to, $machine = '', $os_user = '', $department = '', $limit = 1000) {
+    global $wpdb;
+    $table_logs    = $wpdb->prefix . AW_TRACKER_TABLE_LOGS;
+    $table_devices = $wpdb->prefix . AW_TRACKER_TABLE_DEVICES;
+    list($start, $end) = aw_tracker_time_bounds($time_range, $date_from, $date_to);
+    $now       = new DateTimeImmutable('now', wp_timezone());
+    $now_str   = $now->format('Y-m-d H:i:s');
+    $range_end = $end ? $end : $now;
+    $end_str   = $range_end->format('Y-m-d H:i:s');
+
+    $where = "WHERE l.application_name = 'System Session'";
+    if ($start) {
+        $where .= $wpdb->prepare(" AND l.logged_at >= %s", $start->format('Y-m-d H:i:s'));
+    }
+    // Markers up to two days past the range close sessions that started inside it.
+    $where .= $wpdb->prepare(" AND l.logged_at < %s", $range_end->modify('+2 days')->format('Y-m-d H:i:s'));
+    if ($machine)    $where .= $wpdb->prepare(" AND l.machine_identifier = %s", $machine);
+    if ($os_user)    $where .= $wpdb->prepare(" AND l.os_user = %s", $os_user);
+    if ($department) $where .= $wpdb->prepare(" AND d.department = %s", $department);
+
+    $events = $wpdb->get_results("
+        SELECT l.machine_identifier, l.os_user, l.window_title, l.logged_at
+        FROM {$table_logs} l
+        LEFT JOIN {$table_devices} d ON l.machine_identifier = d.machine_identifier
+        {$where}
+        ORDER BY l.machine_identifier ASC, l.os_user ASC, l.logged_at ASC, l.id ASC
+        LIMIT 50000
+    ");
+
+    $sessions = array();
+    $count    = count($events);
+    for ($i = 0; $i < $count; $i++) {
+        $ev = $events[$i];
+        if (stripos((string) $ev->window_title, 'login') === false || $ev->logged_at >= $end_str) {
+            continue;
+        }
+        $next = null;
+        if ($i + 1 < $count && $events[$i + 1]->machine_identifier === $ev->machine_identifier && $events[$i + 1]->os_user === $ev->os_user) {
+            $next = $events[$i + 1];
+        }
+        $session = array(
+            'machine'  => $ev->machine_identifier,
+            'user'     => $ev->os_user,
+            'login'    => $ev->logged_at,
+            'logout'   => '',
+            'end'      => '',
+            'boundary' => '',
+            'status'   => '',
+        );
+        if ($next && stripos((string) $next->window_title, 'logout') !== false) {
+            $session['logout'] = $session['end'] = $next->logged_at;
+            $session['status'] = 'Logged out';
+        } elseif ($next && stripos((string) $next->window_title, 'interrupt') !== false) {
+            $session['end']    = $next->logged_at;
+            $session['status'] = 'Interrupted (shutdown / crash)';
+        } elseif ($next) {
+            $session['boundary'] = $next->logged_at;
+            $session['status']   = 'No logout recorded';
+        } else {
+            $session['status'] = 'Open';
+        }
+        $sessions[] = $session;
+    }
+
+    usort($sessions, function ($a, $b) { return strcmp($b['login'], $a['login']); });
+    $truncated = count($sessions) > $limit;
+    $sessions  = array_slice($sessions, 0, $limit);
+    $recent    = $now->modify('-20 minutes')->format('Y-m-d H:i:s');
+
+    foreach ($sessions as &$session) {
+        $upper    = $session['end'] ?: ($session['boundary'] ?: $now_str);
+        $activity = $wpdb->get_row($wpdb->prepare("
+            SELECT SUM(CASE WHEN is_idle = 0 THEN duration_seconds ELSE 0 END) AS active_seconds,
+                   MAX(DATE_ADD(logged_at, INTERVAL duration_seconds SECOND)) AS last_activity
+            FROM {$table_logs}
+            WHERE machine_identifier = %s AND os_user = %s AND application_name <> 'System Session'
+              AND logged_at >= %s AND logged_at < %s
+        ", $session['machine'], $session['user'], $session['login'], $upper));
+        $session['active_seconds'] = $activity ? (int) $activity->active_seconds : 0;
+        if (!$session['end']) {
+            $last = ($activity && $activity->last_activity) ? $activity->last_activity : '';
+            $session['end'] = $last ?: $session['login'];
+            if ($session['status'] === 'Open') {
+                $session['status'] = ($session['end'] >= $recent || $session['login'] >= $recent) ? 'Signed in now' : 'No logout recorded';
+            }
+        }
+        $session['duration'] = max(0, strtotime($session['end']) - strtotime($session['login']));
+    }
+    unset($session);
+
+    return array('rows' => $sessions, 'truncated' => $truncated);
+}
+
 function aw_tracker_spreadsheet_safe($value) {
     if (is_string($value) && $value !== '' && strpos("=+-@\t\r", $value[0]) !== false && !is_numeric($value)) {
         return "'" . $value;
@@ -1219,6 +1342,7 @@ function aw_tracker_render_admin_dashboard() {
             <a href="?page=activitywatch-tracker&tab=app_usage" class="nav-tab <?php echo $active_tab === 'app_usage' ? 'nav-tab-active' : ''; ?>">App Usage Report</a>
             <a href="?page=activitywatch-tracker&tab=dept_summary" class="nav-tab <?php echo $active_tab === 'dept_summary' ? 'nav-tab-active' : ''; ?>">Department Summary</a>
             <a href="?page=activitywatch-tracker&tab=user_matrix" class="nav-tab <?php echo $active_tab === 'user_matrix' ? 'nav-tab-active' : ''; ?>">Floating User Matrix</a>
+            <a href="?page=activitywatch-tracker&tab=sessions" class="nav-tab <?php echo $active_tab === 'sessions' ? 'nav-tab-active' : ''; ?>">Login Sessions</a>
             <?php if (current_user_can('manage_options') || current_user_can('manage_aw_tracker')) : ?>
                 <a href="?page=activitywatch-tracker&tab=devices" class="nav-tab <?php echo $active_tab === 'devices' ? 'nav-tab-active' : ''; ?>">Devices & Settings</a>
                 <a href="?page=activitywatch-tracker&tab=diagnostics" class="nav-tab <?php echo $active_tab === 'diagnostics' ? 'nav-tab-active' : ''; ?>" style="color:<?php echo $active_tab === 'diagnostics' ? '' : '#b32d2e'; ?>;">
@@ -2049,6 +2173,125 @@ function aw_tracker_render_admin_dashboard() {
                         <?php endif; ?>
                     </tbody>
                 </table>
+            </div>
+
+        <?php elseif ($active_tab === 'sessions') :
+            $session_user  = isset($_GET['os_user']) ? sanitize_text_field($_GET['os_user']) : '';
+            $session_data  = aw_tracker_session_rows($time_range, $date_from, $date_to, $selected_machine, $session_user, $dept_filter, 1000);
+            $session_rows  = $session_data['rows'];
+            $session_users = $wpdb->get_col("SELECT DISTINCT l.os_user FROM {$table_logs} l" . aw_tracker_scope_join($dept_filter) . " WHERE l.application_name = 'System Session' ORDER BY l.os_user ASC LIMIT 500");
+            $status_counts = array();
+            $distinct_sess_users = array();
+            foreach ($session_rows as $session) {
+                $status_counts[$session['status']] = isset($status_counts[$session['status']]) ? $status_counts[$session['status']] + 1 : 1;
+                $distinct_sess_users[$session['user']] = true;
+            }
+            $session_pages = max(1, (int) ceil(count($session_rows) / $per_page));
+            $session_page  = array_slice($session_rows, ($paged - 1) * $per_page, $per_page);
+            $session_qs    = '&report_type=sessions&time_range=' . urlencode($time_range) . '&date_from=' . urlencode($date_from) . '&date_to=' . urlencode($date_to)
+                           . '&machine=' . urlencode($selected_machine) . '&os_user=' . urlencode($session_user);
+            $status_colors = array(
+                'Logged out'                     => '#00a32a',
+                'Signed in now'                  => '#2271b1',
+                'Interrupted (shutdown / crash)' => '#d63638',
+                'No logout recorded'             => '#996800',
+            );
+        ?>
+            <div style="margin-top:20px; background:#fff; padding:20px; border:1px solid #ccd0d4; border-radius:8px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; background:#f0f0f1; padding:12px; border-radius:6px; flex-wrap:wrap; gap:10px;">
+                    <form method="GET" style="display:flex; gap:15px; align-items:center; flex-wrap:wrap;">
+                        <input type="hidden" name="page" value="activitywatch-tracker">
+                        <input type="hidden" name="tab" value="sessions">
+                        <label><strong>PC:</strong></label>
+                        <select name="machine">
+                            <option value="">-- All PCs --</option>
+                            <?php foreach ($devices as $dev) : ?>
+                                <option value="<?php echo esc_attr($dev->machine_identifier); ?>" <?php selected($selected_machine, $dev->machine_identifier); ?>>
+                                    <?php echo esc_html($dev->machine_identifier); ?> (<?php echo esc_html($dev->department); ?>)
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                        <label><strong>User:</strong></label>
+                        <select name="os_user">
+                            <option value="">-- All Users --</option>
+                            <?php foreach ($session_users as $u) : ?>
+                                <option value="<?php echo esc_attr($u); ?>" <?php selected($session_user, $u); ?>><?php echo esc_html($u); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <label><strong>Time Range:</strong></label>
+                        <?php aw_tracker_time_range_select($time_range, 'sessions', $date_from, $date_to); ?>
+                        <button type="submit" class="button button-primary">Filter</button>
+                        <a href="?page=activitywatch-tracker&tab=sessions" class="button button-secondary">Clear</a>
+                    </form>
+                    <div>
+                        <a href="<?php echo admin_url('admin-post.php?action=aw_export_csv' . $session_qs); ?>" class="button button-secondary">
+                            <span class="dashicons dashicons-download" style="margin-top:4px;"></span> Export CSV
+                        </a>
+                        <a href="<?php echo admin_url('admin-post.php?action=aw_export_xlsx' . $session_qs); ?>" class="button button-secondary" style="color:#217346;">
+                            <span class="dashicons dashicons-media-spreadsheet" style="margin-top:4px;"></span> Export Excel
+                        </a>
+                    </div>
+                </div>
+
+                <h3 style="margin-top:0;">Login Sessions — Who Used Which PC, and When</h3>
+                <p style="margin-top:-6px;">
+                    <strong><?php echo count($session_rows); ?></strong> sessions &nbsp;|&nbsp;
+                    <strong><?php echo count($distinct_sess_users); ?></strong> users
+                    <?php foreach ($status_counts as $label => $n) : ?>
+                        &nbsp;|&nbsp; <span style="color:<?php echo esc_attr(isset($status_colors[$label]) ? $status_colors[$label] : '#50575e'); ?>;"><?php echo esc_html($label); ?>: <strong><?php echo (int) $n; ?></strong></span>
+                    <?php endforeach; ?>
+                </p>
+                <?php if ($session_data['truncated']) : ?>
+                    <div class="notice notice-warning inline"><p>Showing the newest 1,000 sessions. Narrow the time range or filter by PC/user to see older ones.</p></div>
+                <?php endif; ?>
+
+                <table class="widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th>PC</th>
+                            <th>OS / AD User Account</th>
+                            <th>Login</th>
+                            <th>Logout / Session End</th>
+                            <th>Session Duration</th>
+                            <th>Active Time</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (empty($session_page)) : ?>
+                            <tr><td colspan="7" style="color:#888;">No login sessions found for the selected filters. Sessions are recorded by Bridge agent 3.0 or newer.</td></tr>
+                        <?php else : foreach ($session_page as $session) : ?>
+                            <tr>
+                                <td><code><?php echo esc_html($session['machine']); ?></code></td>
+                                <td><strong><code><?php echo esc_html($session['user']); ?></code></strong></td>
+                                <td><?php echo esc_html($session['login']); ?></td>
+                                <td><?php echo esc_html($session['end']); ?><?php if (!$session['logout']) echo ' <span style="color:#888;">' . (strpos($session['status'], 'Interrupted') === 0 ? '(last seen by agent)' : '(last activity)') . '</span>'; ?></td>
+                                <td><?php echo esc_html(aw_tracker_format_duration($session['duration'])); ?></td>
+                                <td><?php echo esc_html(aw_tracker_format_duration($session['active_seconds'])); ?></td>
+                                <td><span style="font-weight:600; color:<?php echo esc_attr(isset($status_colors[$session['status']]) ? $status_colors[$session['status']] : '#50575e'); ?>;"><?php echo esc_html($session['status']); ?></span></td>
+                            </tr>
+                        <?php endforeach; endif; ?>
+                    </tbody>
+                </table>
+
+                <?php if ($session_pages > 1) : ?>
+                    <div class="tablenav"><div class="tablenav-pages" style="margin:12px 0;">
+                        <?php for ($p = 1; $p <= $session_pages; $p++) : ?>
+                            <?php if ($p === $paged) : ?>
+                                <span class="button button-primary" style="margin-right:4px;"><?php echo $p; ?></span>
+                            <?php else : ?>
+                                <a class="button" style="margin-right:4px;" href="<?php echo esc_url(add_query_arg('paged', $p)); ?>"><?php echo $p; ?></a>
+                            <?php endif; ?>
+                        <?php endfor; ?>
+                    </div></div>
+                <?php endif; ?>
+
+                <p style="color:#646970; margin-bottom:0;">
+                    A user switch counts as a logout for the user who leaves and a login for the user who arrives.
+                    <strong>Interrupted</strong>: the PC was shut down or crashed without a logout; the end is the last time the agent saw the session.
+                    <strong>No logout recorded</strong>: no logout was received; the end shown is that user's last activity on the PC.
+                    Session details are kept as long as raw activity logs (see Devices &amp; Settings → retention).
+                </p>
             </div>
 
         <?php elseif ($active_tab === 'devices' && (current_user_can('manage_options') || current_user_can('manage_aw_tracker'))) : 

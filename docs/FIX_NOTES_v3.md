@@ -32,3 +32,12 @@ Not changed on purpose: window titles are still collected, uploaded, stored, sho
 - **An agent started during install never uploaded.** The deploy script killed the agents, but the `run_service.cmd` loop restarted them 30 s later, while the Python runtime was still being copied and before `config.json` was written. That agent read no server URL or token and kept running without uploading (`server_url/api_token missing` in its log). Now the agent re-reads `config.json` whenever the file changes, and the deploy script stops the `run_service.cmd` loops before it kills the agents.
 - **Activity from just before a user switch could be lost.** On switching back, `owned_since` was reset to "now", so anything not yet uploaded from before the switch was discarded. `owned_since` now stays put; the recorded away interval still excludes the other user's time. Away intervals are kept as long as unread events could still need them.
 - **Clearer log.** A switch now logs `Upload before switch: N new/updated records` (or `ActivityWatch not readable`), and the reason is logged when ActivityWatch can't be read.
+
+## Plugin 1.7.0: Login Sessions report
+New tab **Login Sessions** (all report roles; department admins see only their department) answers "Who logged in to PC-010 today?":
+- One row per session: PC, user, login, logout / session end, session duration, active time, status.
+- Built from the agents' existing session markers (User Login, User Logout, Session Interrupted); no agent change needed.
+- A user switch counts as a logout for the user who leaves and a login for the user who arrives.
+- Status: **Logged out**; **Interrupted (shutdown / crash)** with the end set to the last time the agent saw the session; **No logout recorded** with the end set to that user's last activity on the PC; **Signed in now**.
+- Filters for PC, user and time range. CSV / Excel export (`report_type=sessions`).
+- Available for as long as raw activity logs are retained.
