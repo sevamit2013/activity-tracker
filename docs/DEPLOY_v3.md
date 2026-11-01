@@ -50,3 +50,23 @@ You do **not** copy files onto every PC. Fill one shared folder; each PC install
 `-OnlyIfChanged` makes later reboots skip the install unless the agent file in the share, the server URL or the token changed. To update all PCs later, replace the files in the share (or the token in `token.txt`); each PC updates itself on its next reboot.
 
 No Active Directory domain (workgroup PCs)? GPO is not available. Instead, on each PC run the same command once from an Administrator PowerShell, pointing at the share. No file copying is needed. Alternatively use PDQ Deploy, Intune or PsExec.
+
+## Option C: PDQ Deploy (non-domain PCs, if you have a PDQ licence)
+All three options run the same `deploy-aw-client.ps1`; only the delivery differs. Use GPO for domain PCs. Use PDQ for non-domain PCs if you already own it; for only a few PCs, run Option A on each.
+
+1. **New package** "AW Bridge Install". In **Properties → Options**, set **Run As: Deploy User**: an account that is admin on the target PCs. Non-domain PCs need the same local admin account on each PC.
+2. **Step 1 – File Copy:** source `\\SERVER\AW_Setup$` (include sub-folders), target `C:\AW_Setup`, overwrite always.
+3. **Step 2 – Command:**
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\AW_Setup\deploy-aw-client.ps1" -NetworkSharePath "C:\AW_Setup" -ServerEndpoint "https://SERVER/index.php/wp-json/activitywatch/v1/sync" -ApiTokenFile "C:\AW_Setup\token.txt" -OnlyIfChanged
+```
+Success code: 0.
+4. **Deploy Once**, enter the target PCs, click Deploy. PCs that are switched off need the Retry Queue or a schedule (paid PDQ editions).
+5. Check the per-PC results in PDQ, then `C:\Program Files\AWBridge\deploy.log` and the PC's entry in Devices & Settings.
+
+| | A: command per PC | B: GPO | C: PDQ Deploy |
+|---|---|---|---|
+| Works for | any PC | domain PCs only | domain + non-domain (needs an admin account on targets) |
+| Cost | free | free | paid licence (limited free mode) |
+| When it installs | when you run it | next restart | immediately, if the PC is on |
+| Central result view | no | no | yes |
